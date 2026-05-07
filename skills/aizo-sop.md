@@ -150,6 +150,64 @@ of a conversation, and partial sessions produce noisy results.
 
 ---
 
+## SOP 7 — Daily cron scan: refresh confirmed memories
+
+**Trigger:** a scheduled cron job, not a live session event. Recommended frequency: once per day.
+
+**Problem this solves:** `analyze` only discovers *new* preferences. Existing memories whose
+`last_seen` is never refreshed will slowly decay — even if the user demonstrates them every day.
+The cron scan confirms which existing memories are still active and resets their decay clocks.
+
+**The agent's responsibility** (the CLI has no LLM — this logic runs on your side):
+
+1. Collect the past day's session transcripts or recent interaction logs.
+
+2. Load the current preference list:
+```bash
+aizo show
+```
+
+3. Ask your LLM (flash model is fine) with a prompt like:
+```
+Given this list of known user preferences:
+<paste aizo show output>
+
+And these recent interactions:
+<paste session logs>
+
+Which preferences were clearly demonstrated or confirmed today?
+Return ONLY a JSON array of objects: [{"category": "...", "item": "..."}]
+Only include items that were unambiguously present. Return [] if none.
+```
+
+4. For each confirmed item returned by the LLM, call:
+```bash
+aizo touch <category> "<item>"
+```
+
+5. That's it — no new entries created, no scores changed. Only the decay clock resets.
+
+**Example cron setup (runs daily at midnight):**
+```cron
+0 0 * * * /path/to/scan-and-touch.sh
+```
+
+Where `scan-and-touch.sh` is a script that:
+- Collects today's logs
+- Calls the LLM (via API or local model)
+- Pipes confirmed items into `aizo touch` calls
+
+**Key distinction from `analyze`:**
+
+| Command | Creates new entries | Updates scores | Resets `last_seen` |
+|---|---|---|---|
+| `aizo analyze` | Yes | Yes (smoothed) | Yes |
+| `aizo touch` | No | No | Yes |
+
+Use `analyze` to **learn**. Use `touch` (via cron) to **remember**.
+
+---
+
 ## Priority rules
 
 When preferences conflict (e.g. recall returns both a preference and an aversion on

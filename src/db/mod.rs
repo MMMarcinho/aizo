@@ -199,6 +199,33 @@ impl Db {
         Ok(())
     }
 
+    /// Bulk-refresh last_seen for a list of row IDs (used internally by recall).
+    fn touch_ids(&self, ids: Vec<i64>) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now().to_rfc3339();
+        for id in ids {
+            self.conn.execute(
+                "UPDATE preferences SET last_seen = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Reset the decay clock for one entry without changing its score or reason.
+    /// Returns true if the entry was found and updated, false if not found.
+    pub fn touch(&self, category: &str, item: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let n = self.conn.execute(
+            "UPDATE preferences SET last_seen = ?1
+             WHERE category = ?2 AND LOWER(item) = LOWER(?3)",
+            params![now, category, item],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn remove(&self, category: &str, item: &str) -> Result<bool> {
         let n = self.conn.execute(
             "DELETE FROM preferences WHERE category = ?1 AND LOWER(item) = LOWER(?2)",
@@ -278,7 +305,10 @@ impl Db {
                 .collect::<rusqlite::Result<_>>()?;
             x
         };
-        Ok(Self::sorted(rows))
+        let rows = Self::sorted(rows);
+        // Recalling a memory reinforces it — reset decay clock for all hits.
+        self.touch_ids(rows.iter().map(|p| p.id).collect())?;
+        Ok(rows)
     }
 
     pub fn stats(&self) -> Result<Stats> {
