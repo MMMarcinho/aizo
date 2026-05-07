@@ -33,8 +33,11 @@ enum Command {
 
     /// Recall preferences matching a keyword, sorted by effective weight  [primary agent use]
     Recall {
-        /// Keyword to match against item labels and reasons (case-insensitive)
+        /// Keyword matched against item, reason, AND synonyms (case-insensitive)
         query: String,
+        /// Filter by category: preference, aversion, habit, style, taboo (or aliases: love, hate)
+        #[arg(long = "type", short = 't')]
+        kind: Option<String>,
     },
 
     /// Show top-N preferences by current effective weight
@@ -42,10 +45,17 @@ enum Command {
         /// Number of entries to show (default: 10)
         #[arg(default_value = "10")]
         n: usize,
+        /// Filter by category: preference, aversion, habit, style, taboo (or aliases: love, hate)
+        #[arg(long = "type", short = 't')]
+        kind: Option<String>,
     },
 
     /// Print the full preference profile as JSON, sorted by effective weight
-    Show,
+    Show {
+        /// Filter by category: preference, aversion, habit, style, taboo (or aliases: love, hate)
+        #[arg(long = "type", short = 't')]
+        kind: Option<String>,
+    },
 
     /// Manually add or update a preference
     Add {
@@ -85,13 +95,9 @@ enum ConfigCmd {
     /// Show current decay settings
     Show,
     /// Set decay half-life in days (score halves after this many inactive days)
-    SetHalfLife {
-        days: f64,
-    },
-    /// Set minimum decay floor (0.0–1.0; prevents score from reaching zero)
-    SetFloor {
-        floor: f64,
-    },
+    SetHalfLife { days: f64 },
+    /// Set minimum decay floor (0.0–1.0; prevents effective weight from reaching zero)
+    SetFloor { floor: f64 },
 }
 
 fn default_db_path() -> PathBuf {
@@ -115,6 +121,10 @@ fn resolve_category(s: &str) -> Result<(&'static str, f64)> {
     }
 }
 
+fn canonical_category(s: &str) -> Result<&'static str> {
+    Ok(resolve_category(s)?.0)
+}
+
 fn print_entries(entries: &[Preference]) {
     println!("{}", serde_json::to_string_pretty(entries).unwrap());
 }
@@ -124,28 +134,37 @@ fn print_analyze_summary(entries: &[analyzer::ExtractedEntry]) {
     for e in entries {
         *counts.entry(e.category.as_str()).or_insert(0) += 1;
     }
-    let mut parts: Vec<String> = counts
-        .iter()
-        .map(|(k, v)| format!("{v} {k}(s)"))
-        .collect();
+    let mut parts: Vec<String> = counts.iter().map(|(k, v)| format!("{v} {k}(s)")).collect();
     parts.sort();
     println!("✓  Extracted {} entries: {}", entries.len(), parts.join(", "));
 
-    let mut preferences: Vec<_> = entries.iter().filter(|e| e.base_score >= 7.0).collect();
-    let mut aversions: Vec<_> = entries.iter().filter(|e| e.base_score <= 3.0).collect();
-    preferences.sort_by(|a, b| b.base_score.partial_cmp(&a.base_score).unwrap());
-    aversions.sort_by(|a, b| a.base_score.partial_cmp(&b.base_score).unwrap());
+    let mut highs: Vec<_> = entries.iter().filter(|e| e.base_score >= 7.0).collect();
+    let mut lows: Vec<_> = entries.iter().filter(|e| e.base_score <= 3.0).collect();
+    highs.sort_by(|a, b| b.base_score.partial_cmp(&a.base_score).unwrap());
+    lows.sort_by(|a, b| a.base_score.partial_cmp(&b.base_score).unwrap());
 
-    if !preferences.is_empty() {
+    if !highs.is_empty() {
         println!("\nPreferences / loves:");
-        for e in &preferences {
-            println!("  + [{:4.1}] [{}] {}  —  {}", e.base_score, e.category, e.item, e.reason);
+        for e in &highs {
+            println!(
+                "  + [{:4.1}] [{}] {}  —  {}",
+                e.base_score, e.category, e.item, e.reason
+            );
+            if !e.keywords.is_empty() {
+                println!("           keywords: {}", e.keywords.join(", "));
+            }
         }
     }
-    if !aversions.is_empty() {
+    if !lows.is_empty() {
         println!("\nAversions / hates:");
-        for e in &aversions {
-            println!("  - [{:4.1}] [{}] {}  —  {}", e.base_score, e.category, e.item, e.reason);
+        for e in &lows {
+            println!(
+                "  - [{:4.1}] [{}] {}  —  {}",
+                e.base_score, e.category, e.item, e.reason
+            );
+            if !e.keywords.is_empty() {
+                println!("           keywords: {}", e.keywords.join(", "));
+            }
         }
     }
 }
@@ -174,24 +193,27 @@ fn main() -> Result<()> {
             let result = analyzer::analyze(&text, &api_key)?;
 
             for e in &result.entries {
-                db.upsert(&e.category, &e.item, &e.reason, e.base_score, "analysis")?;
+                db.upsert(&e.category, &e.item, &e.reason, &e.keywords, e.base_score, "analysis")?;
             }
             db.log_session(result.entries.len())?;
 
             print_analyze_summary(&result.entries);
         }
 
-        Command::Recall { query } => {
-            let prefs = db.recall(&query)?;
+        Command::Recall { query, kind } => {
+            let cat = kind.as_deref().map(canonical_category).transpose()?;
+            let prefs = db.recall(&query, cat)?;
             if prefs.is_empty() {
-                println!("No preferences matched \"{}\".", query);
+                let scope = cat.map(|c| format!(" in [{c}]")).unwrap_or_default();
+                println!("No preferences matched \"{query}\"{scope}.");
             } else {
                 print_entries(&prefs);
             }
         }
 
-        Command::Top { n } => {
-            let prefs = db.top(n)?;
+        Command::Top { n, kind } => {
+            let cat = kind.as_deref().map(canonical_category).transpose()?;
+            let prefs = db.top(n, cat)?;
             if prefs.is_empty() {
                 println!("No preferences recorded yet.");
             } else {
@@ -199,8 +221,9 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Show => {
-            let prefs = db.all()?;
+        Command::Show { kind } => {
+            let cat = kind.as_deref().map(canonical_category).transpose()?;
+            let prefs = db.all(cat)?;
             if prefs.is_empty() {
                 println!("No preferences recorded yet.");
             } else {
@@ -214,7 +237,7 @@ fn main() -> Result<()> {
                 anyhow::bail!("usage: aizo add <category> <item> <reason…>");
             }
             let reason_str = reason.join(" ");
-            db.upsert(cat, &item, &reason_str, default_score, "manual")?;
+            db.upsert(cat, &item, &reason_str, &[], default_score, "manual")?;
             println!("Added [{cat}]: \"{item}\" (base_score {default_score:.1})");
         }
 

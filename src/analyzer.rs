@@ -14,6 +14,7 @@ Return ONLY a JSON object with this exact shape:
       "category": "<category>",
       "item": "<short label>",
       "reason": "<one sentence>",
+      "keywords": ["<synonym1>", "<synonym2>", ...],
       "base_score": <0.0-10.0>
     }
   ]
@@ -33,6 +34,12 @@ base_score scale:
   7–9  = clear preference
   10   = strong, consistent, high-priority preference
 
+keywords rules:
+- 3–6 synonyms, related terms, or paraphrases that a user might search for to find this entry
+- lowercase only
+- think about alternative ways someone might describe the same concept
+- example for "over-engineered code": ["complexity", "bloat", "abstraction", "yagni", "indirection"]
+
 Rules:
 - Only include entries where base_score ≤ 3 OR base_score ≥ 7 — discard weak signals near neutral.
 - "item" must be a concise reusable label (≤5 words).
@@ -44,6 +51,8 @@ pub struct ExtractedEntry {
     pub category: String,
     pub item: String,
     pub reason: String,
+    #[serde(default)]
+    pub keywords: Vec<String>,
     pub base_score: f64,
 }
 
@@ -106,14 +115,20 @@ pub fn analyze(session_text: &str, api_key: &str) -> Result<ExtractionResult> {
         .collect::<Vec<_>>()
         .join("");
 
-    // Validate extracted categories before returning
     let mut result: ExtractionResult = serde_json::from_str(&raw)
         .with_context(|| format!("flash LLM returned non-JSON: {}", &raw[..raw.len().min(300)]))?;
 
-    const VALID: &[&str] = &["preference", "aversion", "habit", "style", "taboo"];
+    const VALID_CATS: &[&str] = &["preference", "aversion", "habit", "style", "taboo"];
     result.entries.retain(|e| {
-        VALID.contains(&e.category.as_str()) && e.base_score >= 0.0 && e.base_score <= 10.0
+        VALID_CATS.contains(&e.category.as_str())
+            && e.base_score >= 0.0
+            && e.base_score <= 10.0
     });
+
+    // Normalize keywords to lowercase
+    for e in &mut result.entries {
+        e.keywords = e.keywords.iter().map(|k| k.to_lowercase()).collect();
+    }
 
     Ok(result)
 }

@@ -10,6 +10,7 @@ pub struct Preference {
     pub category: String,       // preference | aversion | habit | style | taboo
     pub item: String,
     pub reason: String,
+    pub keywords: Vec<String>,  // synonym/related-term tags for richer recall
     pub base_score: f64,        // 0-10: 0=hard aversion/taboo, 10=strong preference
     pub source: String,         // "analysis" | "manual"
     pub added_at: String,
@@ -20,8 +21,8 @@ pub struct Preference {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DecayConfig {
-    pub half_life_days: f64, // score halves every N days of inactivity
-    pub floor: f64,          // minimum decay coefficient (never reaches zero)
+    pub half_life_days: f64,
+    pub floor: f64,
 }
 
 impl Default for DecayConfig {
@@ -49,6 +50,25 @@ impl Db {
         Ok(db)
     }
 
+    fn schema_version(&self) -> i64 {
+        self.conn
+            .query_row(
+                "SELECT COALESCE((SELECT value FROM schema_meta WHERE key='version'), '1')",
+                [],
+                |r| r.get::<_, String>(0),
+            )
+            .map(|s| s.parse().unwrap_or(1))
+            .unwrap_or(1)
+    }
+
+    fn set_version(&self, v: i64) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', ?1)",
+            params![v.to_string()],
+        )?;
+        Ok(())
+    }
+
     fn migrate(&self) -> Result<()> {
         self.conn.execute_batch("
             PRAGMA journal_mode=WAL;
@@ -58,18 +78,10 @@ impl Db {
             );
         ")?;
 
-        // Read current schema version (default 1 if absent)
-        let version: i64 = self.conn
-            .query_row(
-                "SELECT COALESCE((SELECT value FROM schema_meta WHERE key='version'), '1')",
-                [],
-                |r| r.get::<_, String>(0),
-            )
-            .map(|s| s.parse().unwrap_or(1))
-            .unwrap_or(1);
+        let version = self.schema_version();
 
         if version < 2 {
-            // v1 used love/hate categories and a confidence column — incompatible, drop and rebuild.
+            // v1 used love/hate + confidence — incompatible, drop and rebuild.
             self.conn.execute_batch("
                 DROP TABLE IF EXISTS preferences;
                 DROP TABLE IF EXISTS sessions;
@@ -77,6 +89,7 @@ impl Db {
             ")?;
         }
 
+        // Create v2 tables if they don't exist yet
         self.conn.execute_batch("
             CREATE TABLE IF NOT EXISTS preferences (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,11 +120,14 @@ impl Db {
             );
         ")?;
 
-        self.conn.execute(
-            "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('version', '2')",
-            [],
-        )?;
+        if version < 3 {
+            // Add keywords column (comma-separated synonym tags) introduced in v3
+            self.conn.execute_batch("
+                ALTER TABLE preferences ADD COLUMN keywords TEXT NOT NULL DEFAULT '';
+            ")?;
+        }
 
+        self.set_version(3)?;
         Ok(())
     }
 
@@ -142,8 +158,6 @@ impl Db {
 
     // ── Decay math ──────────────────────────────────────────────────────────
 
-    /// Exponential decay: coefficient = floor + (1 - floor) × exp(-λ × days)
-    /// where λ = ln(2) / half_life_days
     fn decay_coefficient(last_seen: &str, cfg: &DecayConfig) -> f64 {
         let Ok(last) = DateTime::parse_from_rfc3339(last_seen) else {
             return 1.0;
@@ -159,17 +173,24 @@ impl Db {
     }
 
     fn hydrate(row: &rusqlite::Row, cfg: &DecayConfig) -> rusqlite::Result<Preference> {
-        let last_seen: String = row.get(7)?;
-        let base_score: f64 = row.get(4)?;
+        let last_seen: String = row.get(8)?;
+        let keywords_raw: String = row.get(4)?; // SELECT order: id,category,item,reason,keywords,...
+        let base_score: f64 = row.get(5)?;
         let decay = Self::decay_coefficient(&last_seen, cfg);
         Ok(Preference {
             id:                row.get(0)?,
             category:          row.get(1)?,
             item:              row.get(2)?,
             reason:            row.get(3)?,
+            keywords: keywords_raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect(),
             base_score,
-            source:            row.get(5)?,
-            added_at:          row.get(6)?,
+            source:            row.get(6)?,
+            added_at:          row.get(7)?,
             last_seen,
             decay_coefficient: decay,
             effective_weight:  base_score * decay,
@@ -179,25 +200,29 @@ impl Db {
     // ── Writes ───────────────────────────────────────────────────────────────
 
     /// Upsert with score smoothing and last_seen refresh.
-    /// On conflict: new_score = old × 0.4 + incoming × 0.6; last_seen always refreshed.
+    /// On conflict: new_score = old×0.4 + incoming×0.6; keywords and last_seen always updated.
     pub fn upsert(
         &self,
         category: &str,
         item: &str,
         reason: &str,
+        keywords: &[String],
         base_score: f64,
         source: &str,
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
+        let kw = keywords.join(", ");
         self.conn.execute(
-            "INSERT INTO preferences (category, item, reason, base_score, source, added_at, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+            "INSERT INTO preferences
+                (category, item, reason, keywords, base_score, source, added_at, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
              ON CONFLICT(category, LOWER(item)) DO UPDATE SET
                 reason     = excluded.reason,
+                keywords   = excluded.keywords,
                 base_score = base_score * 0.4 + excluded.base_score * 0.6,
                 source     = excluded.source,
                 last_seen  = excluded.last_seen",
-            params![category, item, reason, base_score, source, now],
+            params![category, item, reason, kw, base_score, source, now],
         )?;
         Ok(())
     }
@@ -227,48 +252,54 @@ impl Db {
 
     // ── Reads ────────────────────────────────────────────────────────────────
 
-    fn fetch_sorted(&self, sql: &str, pattern: Option<&str>) -> Result<Vec<Preference>> {
+    const SELECT: &'static str =
+        "SELECT id, category, item, reason, keywords, base_score, source, added_at, last_seen
+         FROM preferences";
+
+    fn sorted(mut rows: Vec<Preference>) -> Vec<Preference> {
+        rows.sort_by(|a, b| b.effective_weight.partial_cmp(&a.effective_weight).unwrap());
+        rows
+    }
+
+    pub fn all(&self, category: Option<&str>) -> Result<Vec<Preference>> {
         let cfg = self.get_decay_config()?;
-        let mut stmt = self.conn.prepare(sql)?;
-        let rows: Vec<Preference> = match pattern {
-            Some(p) => stmt
-                .query_map(params![p], |row| Self::hydrate(row, &cfg))?
-                .collect::<rusqlite::Result<_>>()?,
-            None => stmt
-                .query_map([], |row| Self::hydrate(row, &cfg))?
-                .collect::<rusqlite::Result<_>>()?,
+        let rows: Vec<Preference> = if let Some(cat) = category {
+            let sql = format!("{} WHERE category = ?1", Self::SELECT);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let x = stmt.query_map(params![cat], |row| Self::hydrate(row, &cfg))?
+                .collect::<rusqlite::Result<_>>()?; x
+        } else {
+            let mut stmt = self.conn.prepare(Self::SELECT)?;
+            let x = stmt.query_map([], |row| Self::hydrate(row, &cfg))?
+                .collect::<rusqlite::Result<_>>()?; x
         };
-        let mut rows = rows;
-        rows.sort_by(|a, b| {
-            b.effective_weight
-                .partial_cmp(&a.effective_weight)
-                .unwrap()
-        });
-        Ok(rows)
+        Ok(Self::sorted(rows))
     }
 
-    pub fn all(&self) -> Result<Vec<Preference>> {
-        self.fetch_sorted(
-            "SELECT id, category, item, reason, base_score, source, added_at, last_seen
-             FROM preferences",
-            None,
-        )
-    }
-
-    pub fn top(&self, n: usize) -> Result<Vec<Preference>> {
-        let mut rows = self.all()?;
+    pub fn top(&self, n: usize, category: Option<&str>) -> Result<Vec<Preference>> {
+        let mut rows = self.all(category)?;
         rows.truncate(n);
         Ok(rows)
     }
 
-    pub fn recall(&self, query: &str) -> Result<Vec<Preference>> {
+    /// Keyword recall: matches item, reason, OR keywords column; sorted by effective weight.
+    pub fn recall(&self, query: &str, category: Option<&str>) -> Result<Vec<Preference>> {
+        let cfg = self.get_decay_config()?;
         let pattern = format!("%{}%", query.to_lowercase());
-        self.fetch_sorted(
-            "SELECT id, category, item, reason, base_score, source, added_at, last_seen
-             FROM preferences
-             WHERE LOWER(item) LIKE ?1 OR LOWER(reason) LIKE ?1",
-            Some(&pattern),
-        )
+        let base_filter =
+            "LOWER(item) LIKE ?1 OR LOWER(reason) LIKE ?1 OR LOWER(keywords) LIKE ?1";
+        let rows: Vec<Preference> = if let Some(cat) = category {
+            let sql = format!("{} WHERE ({}) AND category = ?2", Self::SELECT, base_filter);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let x = stmt.query_map(params![pattern, cat], |row| Self::hydrate(row, &cfg))?
+                .collect::<rusqlite::Result<_>>()?; x
+        } else {
+            let sql = format!("{} WHERE {}", Self::SELECT, base_filter);
+            let mut stmt = self.conn.prepare(&sql)?;
+            let x = stmt.query_map(params![pattern], |row| Self::hydrate(row, &cfg))?
+                .collect::<rusqlite::Result<_>>()?; x
+        };
+        Ok(Self::sorted(rows))
     }
 
     pub fn stats(&self) -> Result<Stats> {
