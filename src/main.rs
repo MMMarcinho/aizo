@@ -3,20 +3,19 @@ mod db;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use db::Db;
+use db::{Db, Preference};
 use dirs::home_dir;
 use std::io::Read;
 use std::path::PathBuf;
 
-/// aizo (爱憎) — user preference profiler for AI agents.
+/// aizo (爱憎) — human-like preference memory for AI agents.
 ///
-/// Analyzes session transcripts with a flash LLM to build a persistent list of
-/// what the user loves and hates. Use `recall` to retrieve relevant preferences
-/// during agent planning.
+/// Extracts, quantifies, decays, and recalls user preferences from session
+/// history using a flash LLM + SQLite. Effective weight = base_score × decay.
 #[derive(Parser)]
 #[command(name = "aizo", version, about, long_about = None)]
 struct Cli {
-    /// Path to the SQLite database (overrides AIZO_DB_PATH and default)
+    /// Path to the SQLite database [env: AIZO_DB_PATH]
     #[arg(long, env = "AIZO_DB_PATH", global = true)]
     db: Option<PathBuf>,
 
@@ -32,40 +31,67 @@ enum Command {
         file: Option<PathBuf>,
     },
 
-    /// Recall preferences matching a keyword query (the primary agent use-case)
+    /// Recall preferences matching a keyword, sorted by effective weight  [primary agent use]
     Recall {
-        /// Search term to match against item labels and reasons
+        /// Keyword to match against item labels and reasons (case-insensitive)
         query: String,
     },
 
-    /// Print the full preference profile as JSON
+    /// Show top-N preferences by current effective weight
+    Top {
+        /// Number of entries to show (default: 10)
+        #[arg(default_value = "10")]
+        n: usize,
+    },
+
+    /// Print the full preference profile as JSON, sorted by effective weight
     Show,
 
-    /// Manually add a preference
+    /// Manually add or update a preference
     Add {
-        /// love or hate
+        /// Category: preference|love, aversion|hate, habit, style, taboo
         category: String,
-        /// Short item label (e.g. "dark mode")
+        /// Short item label (e.g. "dark mode", "verbose comments")
         item: String,
-        /// One-sentence reason
+        /// One-sentence reason (remaining words joined)
         #[arg(trailing_var_arg = true, num_args = 1..)]
         reason: Vec<String>,
     },
 
-    /// Remove a preference by label
+    /// Remove a preference by category and item label
     Remove {
-        /// love or hate
+        /// Category: preference|love, aversion|hate, habit, style, taboo
         category: String,
-        /// Item label to remove (case-insensitive)
+        /// Item label to remove (case-insensitive, remaining words joined)
         #[arg(trailing_var_arg = true, num_args = 1..)]
         item: Vec<String>,
     },
 
-    /// Wipe the entire preference profile
+    /// Wipe the entire preference profile and session history
     Clear,
 
-    /// Print database path and statistics
+    /// Show database stats, path, and decay configuration
     Info,
+
+    /// Get or set decay configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigCmd {
+    /// Show current decay settings
+    Show,
+    /// Set decay half-life in days (score halves after this many inactive days)
+    SetHalfLife {
+        days: f64,
+    },
+    /// Set minimum decay floor (0.0–1.0; prevents score from reaching zero)
+    SetFloor {
+        floor: f64,
+    },
 }
 
 fn default_db_path() -> PathBuf {
@@ -73,6 +99,55 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".aizo")
         .join("preferences.db")
+}
+
+/// Map user-facing category names (including aliases) to canonical name + default base_score.
+fn resolve_category(s: &str) -> Result<(&'static str, f64)> {
+    match s {
+        "preference" | "love" => Ok(("preference", 9.0)),
+        "aversion" | "hate" => Ok(("aversion", 1.0)),
+        "habit" => Ok(("habit", 5.0)),
+        "style" => Ok(("style", 8.0)),
+        "taboo" => Ok(("taboo", 0.5)),
+        _ => anyhow::bail!(
+            "unknown category '{s}'. Use: preference (love), aversion (hate), habit, style, taboo"
+        ),
+    }
+}
+
+fn print_entries(entries: &[Preference]) {
+    println!("{}", serde_json::to_string_pretty(entries).unwrap());
+}
+
+fn print_analyze_summary(entries: &[analyzer::ExtractedEntry]) {
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for e in entries {
+        *counts.entry(e.category.as_str()).or_insert(0) += 1;
+    }
+    let mut parts: Vec<String> = counts
+        .iter()
+        .map(|(k, v)| format!("{v} {k}(s)"))
+        .collect();
+    parts.sort();
+    println!("✓  Extracted {} entries: {}", entries.len(), parts.join(", "));
+
+    let mut preferences: Vec<_> = entries.iter().filter(|e| e.base_score >= 7.0).collect();
+    let mut aversions: Vec<_> = entries.iter().filter(|e| e.base_score <= 3.0).collect();
+    preferences.sort_by(|a, b| b.base_score.partial_cmp(&a.base_score).unwrap());
+    aversions.sort_by(|a, b| a.base_score.partial_cmp(&b.base_score).unwrap());
+
+    if !preferences.is_empty() {
+        println!("\nPreferences / loves:");
+        for e in &preferences {
+            println!("  + [{:4.1}] [{}] {}  —  {}", e.base_score, e.category, e.item, e.reason);
+        }
+    }
+    if !aversions.is_empty() {
+        println!("\nAversions / hates:");
+        for e in &aversions {
+            println!("  - [{:4.1}] [{}] {}  —  {}", e.base_score, e.category, e.item, e.reason);
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -98,31 +173,12 @@ fn main() -> Result<()> {
             eprintln!("Analyzing with flash LLM (claude-haiku-4-5)…");
             let result = analyzer::analyze(&text, &api_key)?;
 
-            for p in &result.loves {
-                db.upsert("love", &p.item, &p.reason, p.confidence, "analysis")?;
+            for e in &result.entries {
+                db.upsert(&e.category, &e.item, &e.reason, e.base_score, "analysis")?;
             }
-            for p in &result.hates {
-                db.upsert("hate", &p.item, &p.reason, p.confidence, "analysis")?;
-            }
-            db.log_session(result.loves.len(), result.hates.len())?;
+            db.log_session(result.entries.len())?;
 
-            println!(
-                "✓  Extracted {} love(s) and {} hate(s).",
-                result.loves.len(),
-                result.hates.len()
-            );
-            if !result.loves.is_empty() {
-                println!("\nLoves:");
-                for p in &result.loves {
-                    println!("  + [{:3.0}%] {}  —  {}", p.confidence * 100.0, p.item, p.reason);
-                }
-            }
-            if !result.hates.is_empty() {
-                println!("\nHates:");
-                for p in &result.hates {
-                    println!("  - [{:3.0}%] {}  —  {}", p.confidence * 100.0, p.item, p.reason);
-                }
-            }
+            print_analyze_summary(&result.entries);
         }
 
         Command::Recall { query } => {
@@ -130,36 +186,49 @@ fn main() -> Result<()> {
             if prefs.is_empty() {
                 println!("No preferences matched \"{}\".", query);
             } else {
-                println!("{}", serde_json::to_string_pretty(&prefs)?);
+                print_entries(&prefs);
+            }
+        }
+
+        Command::Top { n } => {
+            let prefs = db.top(n)?;
+            if prefs.is_empty() {
+                println!("No preferences recorded yet.");
+            } else {
+                print_entries(&prefs);
             }
         }
 
         Command::Show => {
             let prefs = db.all()?;
-            println!("{}", serde_json::to_string_pretty(&prefs)?);
+            if prefs.is_empty() {
+                println!("No preferences recorded yet.");
+            } else {
+                print_entries(&prefs);
+            }
         }
 
         Command::Add { category, item, reason } => {
-            let cat = validate_category(&category)?;
+            let (cat, default_score) = resolve_category(&category)?;
             if reason.is_empty() {
-                anyhow::bail!("usage: aizo add love|hate <item> <reason…>");
+                anyhow::bail!("usage: aizo add <category> <item> <reason…>");
             }
             let reason_str = reason.join(" ");
-            db.upsert(cat, &item, &reason_str, 1.0, "manual")?;
-            println!("Added {cat}: \"{item}\"");
+            db.upsert(cat, &item, &reason_str, default_score, "manual")?;
+            println!("Added [{cat}]: \"{item}\" (base_score {default_score:.1})");
         }
 
         Command::Remove { category, item } => {
-            let cat = validate_category(&category)?;
+            let (cat, _) = resolve_category(&category)?;
             let item_str = item.join(" ");
             if item_str.is_empty() {
-                anyhow::bail!("usage: aizo remove love|hate <item…>");
+                anyhow::bail!("usage: aizo remove <category> <item…>");
             }
             let removed = db.remove(cat, &item_str)?;
             if removed {
-                println!("Removed \"{item_str}\" from {cat}s.");
+                println!("Removed [{cat}]: \"{item_str}\"");
             } else {
-                println!("\"{}\" not found in {cat}s.", item_str);
+                println!("Not found: [{cat}] \"{item_str}\"");
             }
         }
 
@@ -169,21 +238,44 @@ fn main() -> Result<()> {
         }
 
         Command::Info => {
-            let (loves, hates, sessions) = db.stats()?;
-            println!("Database : {}", db_path.display());
-            println!("Loves    : {loves}");
-            println!("Hates    : {hates}");
-            println!("Sessions : {sessions}");
+            let stats = db.stats()?;
+            let cfg = db.get_decay_config()?;
+            println!("Database    : {}", db_path.display());
+            println!("Total       : {}", stats.total());
+            println!("  preference: {}", stats.preferences);
+            println!("  aversion  : {}", stats.aversions);
+            println!("  habit     : {}", stats.habits);
+            println!("  style     : {}", stats.styles);
+            println!("  taboo     : {}", stats.taboos);
+            println!("Sessions    : {}", stats.sessions);
+            println!("Decay");
+            println!("  half-life : {} days", cfg.half_life_days);
+            println!("  floor     : {}", cfg.floor);
         }
+
+        Command::Config { action } => match action {
+            ConfigCmd::Show => {
+                let cfg = db.get_decay_config()?;
+                println!("{}", serde_json::to_string_pretty(&cfg)?);
+            }
+            ConfigCmd::SetHalfLife { days } => {
+                if days <= 0.0 {
+                    anyhow::bail!("half-life must be > 0");
+                }
+                let cfg = db.get_decay_config()?;
+                db.set_decay_config(days, cfg.floor)?;
+                println!("Decay half-life set to {days} days.");
+            }
+            ConfigCmd::SetFloor { floor } => {
+                if !(0.0..1.0).contains(&floor) {
+                    anyhow::bail!("floor must be in [0.0, 1.0)");
+                }
+                let cfg = db.get_decay_config()?;
+                db.set_decay_config(cfg.half_life_days, floor)?;
+                println!("Decay floor set to {floor}.");
+            }
+        },
     }
 
     Ok(())
-}
-
-fn validate_category(s: &str) -> Result<&'static str> {
-    match s {
-        "love" => Ok("love"),
-        "hate" => Ok("hate"),
-        _ => anyhow::bail!("category must be 'love' or 'hate', got '{s}'"),
-    }
 }

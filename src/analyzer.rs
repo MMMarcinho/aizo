@@ -4,35 +4,52 @@ use serde::{Deserialize, Serialize};
 // claude-haiku-4-5: fastest, cheapest — ideal for lightweight extraction
 const FLASH_MODEL: &str = "claude-haiku-4-5-20251001";
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
-const SYSTEM_PROMPT: &str = r#"You are a preference-extraction engine. Given a conversation or session transcript, identify what the user explicitly or implicitly loves and hates — their stylistic preferences, workflow habits, values, pet peeves, and strong opinions.
+
+const SYSTEM_PROMPT: &str = r#"You are a user preference extraction engine. Analyze the conversation and identify the user's explicit and implicit preferences, aversions, habits, communication styles, and hard limits.
 
 Return ONLY a JSON object with this exact shape:
 {
-  "loves": [
-    { "item": "<short label>", "reason": "<one sentence why>", "confidence": <0.0-1.0> }
-  ],
-  "hates": [
-    { "item": "<short label>", "reason": "<one sentence why>", "confidence": <0.0-1.0> }
+  "entries": [
+    {
+      "category": "<category>",
+      "item": "<short label>",
+      "reason": "<one sentence>",
+      "base_score": <0.0-10.0>
+    }
   ]
 }
 
+Category definitions:
+- "preference"  — things the user consistently likes, prioritizes, or favors (base_score 7–10)
+- "aversion"    — things the user dislikes, avoids, or rejects (base_score 0–3)
+- "habit"       — behavioral or workflow patterns, value-neutral (base_score 4–6)
+- "style"       — communication, tone, or formatting preferences (base_score 5–10)
+- "taboo"       — hard limits, absolute rejections, must-never-do (base_score 0–2)
+
+base_score scale:
+  0    = absolute taboo / strong rejection
+  1–3  = clear dislike
+  4–6  = neutral tendency / weak pattern
+  7–9  = clear preference
+  10   = strong, consistent, high-priority preference
+
 Rules:
-- "item" must be a short, reusable label (e.g. "concise code", "verbose comments", "dark mode")
-- Only include preferences with confidence >= 0.5
-- Return an empty array if no preferences detected for that category
-- Do not wrap in markdown fences — raw JSON only"#;
+- Only include entries where base_score ≤ 3 OR base_score ≥ 7 — discard weak signals near neutral.
+- "item" must be a concise reusable label (≤5 words).
+- Return {"entries": []} if no strong signals detected.
+- Raw JSON only — no markdown fences, no explanation."#;
 
 #[derive(Debug, Deserialize, Serialize)]
-pub struct ExtractedPref {
+pub struct ExtractedEntry {
+    pub category: String,
     pub item: String,
     pub reason: String,
-    pub confidence: f64,
+    pub base_score: f64,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ExtractionResult {
-    pub loves: Vec<ExtractedPref>,
-    pub hates: Vec<ExtractedPref>,
+    pub entries: Vec<ExtractedEntry>,
 }
 
 #[derive(Serialize)]
@@ -89,8 +106,16 @@ pub fn analyze(session_text: &str, api_key: &str) -> Result<ExtractionResult> {
         .collect::<Vec<_>>()
         .join("");
 
-    serde_json::from_str(&raw)
-        .with_context(|| format!("flash LLM returned non-JSON: {}", &raw[..raw.len().min(200)]))
+    // Validate extracted categories before returning
+    let mut result: ExtractionResult = serde_json::from_str(&raw)
+        .with_context(|| format!("flash LLM returned non-JSON: {}", &raw[..raw.len().min(300)]))?;
+
+    const VALID: &[&str] = &["preference", "aversion", "habit", "style", "taboo"];
+    result.entries.retain(|e| {
+        VALID.contains(&e.category.as_str()) && e.base_score >= 0.0 && e.base_score <= 10.0
+    });
+
+    Ok(result)
 }
 
 pub fn api_key_from_env() -> Result<String> {
