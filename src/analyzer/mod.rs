@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-// claude-haiku-4-5: fastest, cheapest — ideal for lightweight extraction
-const FLASH_MODEL: &str = "claude-haiku-4-5-20251001";
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
+const DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
+const DEFAULT_API_URL: &str = "https://api.anthropic.com/v1/messages";
 
 const SYSTEM_PROMPT: &str = r#"You are a user preference extraction engine. Analyze the conversation and identify the user's explicit and implicit preferences, aversions, habits, communication styles, and hard limits.
 
@@ -69,9 +68,9 @@ struct Message {
 
 #[derive(Serialize)]
 struct Request {
-    model: &'static str,
+    model: String,
     max_tokens: u32,
-    system: &'static str,
+    system: String,
     messages: Vec<Message>,
 }
 
@@ -87,18 +86,29 @@ struct ApiResponse {
     content: Vec<ContentBlock>,
 }
 
-pub fn analyze(session_text: &str, api_key: &str) -> Result<ExtractionResult> {
+pub fn analyze(session_text: &str, api_key: &str, existing_profile: Option<&str>) -> Result<ExtractionResult> {
+    let model = std::env::var("AIZO_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+    let api_url = std::env::var("AIZO_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
+
+    let system = match existing_profile {
+        Some(profile) => format!(
+            "{}\n\nAlready-stored preferences (reference only — skip re-extracting unless meaningfully changed):\n{}",
+            SYSTEM_PROMPT, profile
+        ),
+        None => SYSTEM_PROMPT.to_string(),
+    };
+
     let body = Request {
-        model: FLASH_MODEL,
+        model,
         max_tokens: 1024,
-        system: SYSTEM_PROMPT,
+        system,
         messages: vec![Message {
             role: "user",
             content: format!("Extract user preferences from this session:\n\n{session_text}"),
         }],
     };
 
-    let response = ureq::post(API_URL)
+    let response = ureq::post(&api_url)
         .set("x-api-key", api_key)
         .set("anthropic-version", "2023-06-01")
         .set("content-type", "application/json")
@@ -125,7 +135,6 @@ pub fn analyze(session_text: &str, api_key: &str) -> Result<ExtractionResult> {
             && e.base_score <= 10.0
     });
 
-    // Normalize keywords to lowercase
     for e in &mut result.entries {
         e.keywords = e.keywords.iter().map(|k| k.to_lowercase()).collect();
     }

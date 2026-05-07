@@ -39,6 +39,9 @@ enum Command {
         /// Filter by category: preference, aversion, habit, style, taboo (or aliases: love, hate)
         #[arg(long = "type", short = 't')]
         kind: Option<String>,
+        /// Do not refresh last_seen for matched entries
+        #[arg(long)]
+        no_touch: bool,
     },
 
     /// Show top-N preferences by current effective weight
@@ -138,6 +141,26 @@ fn canonical_category(s: &str) -> Result<&'static str> {
     Ok(resolve_category(s)?.0)
 }
 
+/// FNV-1a 64-bit hash — stable, dependency-free, good enough for dedup.
+fn content_hash(s: &str) -> String {
+    const OFFSET: u64 = 14695981039346656037;
+    const PRIME: u64 = 1099511628211;
+    let mut h = OFFSET;
+    for byte in s.bytes() {
+        h ^= byte as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    format!("{h:016x}")
+}
+
+fn format_profile_context(prefs: &[Preference]) -> String {
+    prefs
+        .iter()
+        .map(|p| format!("[{}] {} ({:.1}): {}", p.category, p.item, p.base_score, p.reason))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn print_entries(entries: &[Preference]) {
     println!("{}", serde_json::to_string_pretty(entries).unwrap());
 }
@@ -201,21 +224,34 @@ fn main() -> Result<()> {
                 anyhow::bail!("no session text provided");
             }
 
+            let hash = content_hash(&text);
+            if db.has_analyzed(&hash)? {
+                eprintln!("Session already analyzed (hash {hash}), skipping.");
+                return Ok(());
+            }
+
+            let existing_prefs = db.top(20, None)?;
+            let existing_profile = if existing_prefs.is_empty() {
+                None
+            } else {
+                Some(format_profile_context(&existing_prefs))
+            };
+
             let api_key = analyzer::api_key_from_env()?;
-            eprintln!("Analyzing with flash LLM (claude-haiku-4-5)…");
-            let result = analyzer::analyze(&text, &api_key)?;
+            eprintln!("Analyzing with flash LLM…");
+            let result = analyzer::analyze(&text, &api_key, existing_profile.as_deref())?;
 
             for e in &result.entries {
                 db.upsert(&e.category, &e.item, &e.reason, &e.keywords, e.base_score, "analysis")?;
             }
-            db.log_session(result.entries.len())?;
+            db.log_session(result.entries.len(), &hash)?;
 
             print_analyze_summary(&result.entries);
         }
 
-        Command::Recall { query, kind } => {
+        Command::Recall { query, kind, no_touch } => {
             let cat = kind.as_deref().map(canonical_category).transpose()?;
-            let prefs = db.recall(&query, cat)?;
+            let prefs = db.recall(&query, cat, !no_touch)?;
             if prefs.is_empty() {
                 let scope = cat.map(|c| format!(" in [{c}]")).unwrap_or_default();
                 println!("No preferences matched \"{query}\"{scope}.");
