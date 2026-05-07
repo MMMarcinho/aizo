@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+
+use crate::scoring::{self, DecayConfig};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preference {
@@ -11,27 +13,13 @@ pub struct Preference {
     pub item: String,
     pub reason: String,
     pub keywords: Vec<String>,  // synonym/related-term tags for richer recall
-    pub base_score: f64,        // 0-10: 0=hard aversion/taboo, 10=strong preference
+    pub base_score: f64,        // 0–10: 0 = hard aversion/taboo, 10 = strong preference
     pub source: String,         // "analysis" | "manual"
     pub added_at: String,
-    pub last_seen: String,      // reset each time the entry is reinforced
-    pub decay_coefficient: f64, // computed: 0.0–1.0
-    pub effective_weight: f64,  // base_score × decay_coefficient
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DecayConfig {
-    pub half_life_days: f64,
-    pub floor: f64,
-}
-
-impl Default for DecayConfig {
-    fn default() -> Self {
-        Self {
-            half_life_days: 30.0,
-            floor: 0.1,
-        }
-    }
+    pub last_seen: String,      // reset on every reinforcement; drives decay clock
+    pub score_exponent: f64,    // α = (10 − s) / 10
+    pub decay_coefficient: f64, // d(t) ∈ [floor, 1.0]
+    pub effective_weight: f64,  // w = s · d(t)^α
 }
 
 pub struct Db {
@@ -49,6 +37,8 @@ impl Db {
         db.migrate()?;
         Ok(db)
     }
+
+    // ── Schema migration ─────────────────────────────────────────────────────
 
     fn schema_version(&self) -> i64 {
         self.conn
@@ -81,7 +71,6 @@ impl Db {
         let version = self.schema_version();
 
         if version < 2 {
-            // v1 used love/hate + confidence — incompatible, drop and rebuild.
             self.conn.execute_batch("
                 DROP TABLE IF EXISTS preferences;
                 DROP TABLE IF EXISTS sessions;
@@ -89,7 +78,6 @@ impl Db {
             ")?;
         }
 
-        // Create v2 tables if they don't exist yet
         self.conn.execute_batch("
             CREATE TABLE IF NOT EXISTS preferences (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,29 +109,23 @@ impl Db {
         ")?;
 
         if version < 3 {
-            // Add keywords column (comma-separated synonym tags) introduced in v3
-            self.conn.execute_batch("
-                ALTER TABLE preferences ADD COLUMN keywords TEXT NOT NULL DEFAULT '';
-            ")?;
+            self.conn.execute_batch(
+                "ALTER TABLE preferences ADD COLUMN keywords TEXT NOT NULL DEFAULT '';",
+            )?;
         }
 
         self.set_version(3)?;
         Ok(())
     }
 
-    // ── Decay config ────────────────────────────────────────────────────────
+    // ── Decay config ─────────────────────────────────────────────────────────
 
     pub fn get_decay_config(&self) -> Result<DecayConfig> {
         self.conn
             .query_row(
                 "SELECT half_life_days, floor FROM decay_config WHERE id = 1",
                 [],
-                |row| {
-                    Ok(DecayConfig {
-                        half_life_days: row.get(0)?,
-                        floor: row.get(1)?,
-                    })
-                },
+                |row| Ok(DecayConfig { half_life_days: row.get(0)?, floor: row.get(1)? }),
             )
             .map_err(Into::into)
     }
@@ -156,27 +138,17 @@ impl Db {
         Ok(())
     }
 
-    // ── Decay math ──────────────────────────────────────────────────────────
+    // ── Row hydration ────────────────────────────────────────────────────────
 
-    fn decay_coefficient(last_seen: &str, cfg: &DecayConfig) -> f64 {
-        let Ok(last) = DateTime::parse_from_rfc3339(last_seen) else {
-            return 1.0;
-        };
-        let days = Utc::now()
-            .signed_duration_since(last)
-            .num_seconds()
-            .max(0) as f64
-            / 86_400.0;
-        let lambda = std::f64::consts::LN_2 / cfg.half_life_days;
-        let raw = (-lambda * days).exp();
-        cfg.floor + (1.0 - cfg.floor) * raw
-    }
-
+    // SELECT column order: id(0) category(1) item(2) reason(3)
+    //                      keywords(4) base_score(5) source(6) added_at(7) last_seen(8)
     fn hydrate(row: &rusqlite::Row, cfg: &DecayConfig) -> rusqlite::Result<Preference> {
         let last_seen: String = row.get(8)?;
-        let keywords_raw: String = row.get(4)?; // SELECT order: id,category,item,reason,keywords,...
+        let keywords_raw: String = row.get(4)?;
         let base_score: f64 = row.get(5)?;
-        let decay = Self::decay_coefficient(&last_seen, cfg);
+
+        let s = scoring::compute(base_score, &last_seen, cfg);
+
         Ok(Preference {
             id:                row.get(0)?,
             category:          row.get(1)?,
@@ -192,15 +164,15 @@ impl Db {
             source:            row.get(6)?,
             added_at:          row.get(7)?,
             last_seen,
-            decay_coefficient: decay,
-            effective_weight:  base_score * decay,
+            score_exponent:    s.score_exponent,
+            decay_coefficient: s.decay_coefficient,
+            effective_weight:  s.effective_weight,
         })
     }
 
-    // ── Writes ───────────────────────────────────────────────────────────────
+    // ── Writes ────────────────────────────────────────────────────────────────
 
-    /// Upsert with score smoothing and last_seen refresh.
-    /// On conflict: new_score = old×0.4 + incoming×0.6; keywords and last_seen always updated.
+    /// Upsert with score smoothing (new = old×0.4 + incoming×0.6) and last_seen refresh.
     pub fn upsert(
         &self,
         category: &str,
@@ -250,7 +222,7 @@ impl Db {
         Ok(())
     }
 
-    // ── Reads ────────────────────────────────────────────────────────────────
+    // ── Reads ─────────────────────────────────────────────────────────────────
 
     const SELECT: &'static str =
         "SELECT id, category, item, reason, keywords, base_score, source, added_at, last_seen
@@ -266,12 +238,16 @@ impl Db {
         let rows: Vec<Preference> = if let Some(cat) = category {
             let sql = format!("{} WHERE category = ?1", Self::SELECT);
             let mut stmt = self.conn.prepare(&sql)?;
-            let x = stmt.query_map(params![cat], |row| Self::hydrate(row, &cfg))?
-                .collect::<rusqlite::Result<_>>()?; x
+            let x = stmt
+                .query_map(params![cat], |row| Self::hydrate(row, &cfg))?
+                .collect::<rusqlite::Result<_>>()?;
+            x
         } else {
             let mut stmt = self.conn.prepare(Self::SELECT)?;
-            let x = stmt.query_map([], |row| Self::hydrate(row, &cfg))?
-                .collect::<rusqlite::Result<_>>()?; x
+            let x = stmt
+                .query_map([], |row| Self::hydrate(row, &cfg))?
+                .collect::<rusqlite::Result<_>>()?;
+            x
         };
         Ok(Self::sorted(rows))
     }
@@ -282,22 +258,25 @@ impl Db {
         Ok(rows)
     }
 
-    /// Keyword recall: matches item, reason, OR keywords column; sorted by effective weight.
     pub fn recall(&self, query: &str, category: Option<&str>) -> Result<Vec<Preference>> {
         let cfg = self.get_decay_config()?;
         let pattern = format!("%{}%", query.to_lowercase());
-        let base_filter =
+        let filter =
             "LOWER(item) LIKE ?1 OR LOWER(reason) LIKE ?1 OR LOWER(keywords) LIKE ?1";
         let rows: Vec<Preference> = if let Some(cat) = category {
-            let sql = format!("{} WHERE ({}) AND category = ?2", Self::SELECT, base_filter);
+            let sql = format!("{} WHERE ({}) AND category = ?2", Self::SELECT, filter);
             let mut stmt = self.conn.prepare(&sql)?;
-            let x = stmt.query_map(params![pattern, cat], |row| Self::hydrate(row, &cfg))?
-                .collect::<rusqlite::Result<_>>()?; x
+            let x = stmt
+                .query_map(params![pattern, cat], |row| Self::hydrate(row, &cfg))?
+                .collect::<rusqlite::Result<_>>()?;
+            x
         } else {
-            let sql = format!("{} WHERE {}", Self::SELECT, base_filter);
+            let sql = format!("{} WHERE {}", Self::SELECT, filter);
             let mut stmt = self.conn.prepare(&sql)?;
-            let x = stmt.query_map(params![pattern], |row| Self::hydrate(row, &cfg))?
-                .collect::<rusqlite::Result<_>>()?; x
+            let x = stmt
+                .query_map(params![pattern], |row| Self::hydrate(row, &cfg))?
+                .collect::<rusqlite::Result<_>>()?;
+            x
         };
         Ok(Self::sorted(rows))
     }

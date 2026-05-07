@@ -21,32 +21,47 @@ session transcript
   SQLite (~/.aizo/preferences.db)
        │
        ▼
-  effective_weight = base_score × decay_coefficient
+  effective_weight = s · d(t)^α   (score-modulated decay)
        │  keyword or top-N recall
        ▼
   agent reads profile → personalizes response
 ```
 
-### Time-decay mechanism
+### Scoring formula
 
-Human memory fades. aizo replicates this with an **exponential decay** applied to every entry at read time:
+All scoring logic lives in `src/scoring/mod.rs`. Every preference entry carries three computed fields, derived at read time from its `base_score` and `last_seen` timestamp.
 
-```
-decay_coefficient = floor + (1 − floor) × exp(−λ × days_inactive)
-                where λ = ln(2) / half_life_days
+**Step 1 — Decay coefficient** $d(t)$
 
-effective_weight = base_score × decay_coefficient
-```
+$$d(t) = \phi + (1 - \phi)\,e^{-\lambda t}, \qquad \lambda = \frac{\ln 2}{t_{1/2}}$$
 
-| Days inactive | Coefficient (default: half-life=30d, floor=0.1) |
-|---|---|
-| 0  | 1.00 |
-| 30 | 0.55 |
-| 60 | 0.33 |
-| 90 | 0.21 |
-| ∞  | 0.10 (floor — never zero) |
+where $t$ is days since `last_seen`, $t_{1/2}$ is the configured half-life, and $\phi$ is the floor.
 
-Entries are **never hard-deleted by decay** — they sink to the floor and persist as weak long-term memory.
+**Step 2 — Score-dependent exponent** $\alpha$
+
+$$\alpha = \frac{10 - s}{10}$$
+
+Higher score → smaller $\alpha$ → decay has less effect. A score-10 preference ($\alpha = 0$) is fully decay-resistant; a score-0 entry ($\alpha = 1$) decays at full speed.
+
+**Step 3 — Effective weight** $w$
+
+$$w = s \cdot d(t)^{\,\alpha}$$
+
+Expanding into a single expression:
+
+$$\boxed{w = s \cdot \left[\phi + (1-\phi)\,e^{-\lambda t}\right]^{\!\frac{10-s}{10}}}$$
+
+**Boundary behaviour**
+
+| Score $s$ | $\alpha$ | Decay effect | Interpretation |
+|---|---|---|---|
+| 10 | 0.0 | None — $d^0 = 1$ | Core value, never fades |
+| 7  | 0.3 | Slight | Strong preference, slow fade |
+| 5  | 0.5 | Moderate | Neutral habit, fades at half speed |
+| 1  | 0.9 | Near-full | Weak aversion, fades quickly |
+| 0  | 1.0 | Full | $w = 0$ always — absolute zero |
+
+Entries are **never hard-deleted by decay** — they sink toward the floor and persist as weak long-term memory. Use `--type taboo` to surface them explicitly regardless of effective weight.
 
 ### Scoring scale (0–10)
 

@@ -1,5 +1,6 @@
 mod analyzer;
 mod db;
+mod scoring;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
