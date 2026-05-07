@@ -206,11 +206,14 @@ import subprocess, json
 def top_preferences(n: int = 10) -> list[dict]:
     return json.loads(subprocess.check_output(["aizo", "top", str(n)]))
 
-def recall(query: str) -> list[dict]:
-    return json.loads(subprocess.check_output(["aizo", "recall", query]))
+def recall(query: str, kind: str | None = None) -> list[dict]:
+    cmd = ["aizo", "recall", query]
+    if kind:
+        cmd += ["--type", kind]
+    return json.loads(subprocess.check_output(cmd))
 
 # Inject into system prompt before generating
-prefs = top_preferences(5)
+prefs = top_preferences(10)
 system = f"User preferences:\n{json.dumps(prefs, indent=2)}\n\n{base_system}"
 ```
 
@@ -220,6 +223,32 @@ Or configure `AIZO_DB_PATH` per-project to maintain separate profiles:
 export AIZO_DB_PATH=./project-prefs.db
 aizo show
 ```
+
+---
+
+## Standard Operating Procedure (SOP)
+
+The SOP for how an agent should use aizo is defined as a skill file at
+`skills/aizo-sop.md`. Copy it into your agent's skill/instruction directory
+(e.g. `.claude/skills/` for Claude Code) and any agent in that project will
+automatically follow the protocol.
+
+The skill defines six triggers:
+
+| # | Trigger | aizo call | Timing |
+|---|---|---|---|
+| 1 | Session starts | `aizo top 20` → format as prose header | Sync, before first reply |
+| 2 | User shows negative feedback | `aizo add aversion …` then `aizo recall <topic>` | Sync, before corrected reply |
+| 3 | User praises something | `aizo add preference …` | Async, after reply sent |
+| 4 | User states an explicit rule | `aizo add taboo/preference …` | Sync, immediate |
+| 5 | About to generate on topic X | `aizo recall <X>` | Sync, before generation |
+| 6 | Session ends | `aizo analyze <transcript>` | Async, background |
+
+**Key rules encoded in the skill:**
+- Taboos always win over preferences in conflicts
+- `analyze` is for full sessions, not single messages — it calls an LLM
+- Silence (`recall` returning nothing) means no data, not neutral preference
+- Never mention aizo to the user — it runs silently
 
 ---
 
