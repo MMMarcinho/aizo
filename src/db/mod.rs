@@ -102,10 +102,13 @@ impl Db {
                 VALUES (1, 30.0, 0.1);
 
             CREATE TABLE IF NOT EXISTS sessions (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                analyzed_at TEXT    NOT NULL,
-                extracted   INTEGER NOT NULL DEFAULT 0
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                analyzed_at  TEXT    NOT NULL,
+                extracted    INTEGER NOT NULL DEFAULT 0,
+                content_hash TEXT    NOT NULL DEFAULT ''
             );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_hash
+                ON sessions(content_hash) WHERE content_hash != '';
         ")?;
 
         if version < 3 {
@@ -114,7 +117,15 @@ impl Db {
             )?;
         }
 
-        self.set_version(3)?;
+        if version < 4 {
+            self.conn.execute_batch("
+                ALTER TABLE sessions ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_hash
+                    ON sessions(content_hash) WHERE content_hash != '';
+            ")?;
+        }
+
+        self.set_version(4)?;
         Ok(())
     }
 
@@ -205,12 +216,19 @@ impl Db {
             return Ok(());
         }
         let now = Utc::now().to_rfc3339();
-        for id in ids {
-            self.conn.execute(
-                "UPDATE preferences SET last_seen = ?1 WHERE id = ?2",
-                params![now, id],
-            )?;
-        }
+        let placeholders = ids.iter().enumerate()
+            .map(|(i, _)| format!("?{}", i + 2))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "UPDATE preferences SET last_seen = ?1 WHERE id IN ({})",
+            placeholders
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        stmt.execute(rusqlite::params_from_iter(
+            std::iter::once(rusqlite::types::Value::Text(now))
+                .chain(ids.iter().map(|&id| rusqlite::types::Value::Integer(id))),
+        ))?;
         Ok(())
     }
 
@@ -240,11 +258,21 @@ impl Db {
         Ok(())
     }
 
-    pub fn log_session(&self, extracted: usize) -> Result<()> {
+    pub fn has_analyzed(&self, hash: &str) -> Result<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE content_hash = ?1",
+            params![hash],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    pub fn log_session(&self, extracted: usize, hash: &str) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO sessions (analyzed_at, extracted) VALUES (?1, ?2)",
-            params![now, extracted as i64],
+            "INSERT OR IGNORE INTO sessions (analyzed_at, extracted, content_hash)
+             VALUES (?1, ?2, ?3)",
+            params![now, extracted as i64, hash],
         )?;
         Ok(())
     }
@@ -285,7 +313,7 @@ impl Db {
         Ok(rows)
     }
 
-    pub fn recall(&self, query: &str, category: Option<&str>) -> Result<Vec<Preference>> {
+    pub fn recall(&self, query: &str, category: Option<&str>, touch: bool) -> Result<Vec<Preference>> {
         let cfg = self.get_decay_config()?;
         let pattern = format!("%{}%", query.to_lowercase());
         let filter =
@@ -306,8 +334,9 @@ impl Db {
             x
         };
         let rows = Self::sorted(rows);
-        // Recalling a memory reinforces it — reset decay clock for all hits.
-        self.touch_ids(rows.iter().map(|p| p.id).collect())?;
+        if touch {
+            self.touch_ids(rows.iter().map(|p| p.id).collect())?;
+        }
         Ok(rows)
     }
 

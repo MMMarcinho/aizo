@@ -26,11 +26,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Analyze a session file (or stdin) with the flash LLM and update preferences
+    /// Analyze a session file (or stdin) with the configured LLM and update preferences
+    ///
+    /// Requires LLM configuration via env vars (AIZO_MODEL, AIZO_API_KEY, etc.).
+    /// For LLM-agnostic analysis use: aizo extract [file] | <llm> | aizo import
     Analyze {
         /// Path to session text file; reads stdin if omitted
         file: Option<PathBuf>,
     },
+
+    /// Print the extraction prompt to stdout — pipe to any LLM, then pipe output to 'aizo import'
+    ///
+    /// Example: aizo extract chat.txt | ollama run qwen2.5:3b | aizo import
+    Extract {
+        /// Path to session text file; reads stdin if omitted
+        file: Option<PathBuf>,
+    },
+
+    /// Read a preference JSON response from stdin and upsert entries
+    ///
+    /// Accepts the {"entries":[...]} format produced by any LLM given the 'aizo extract' prompt.
+    Import,
 
     /// Recall preferences matching a keyword, sorted by effective weight  [primary agent use]
     Recall {
@@ -39,6 +55,9 @@ enum Command {
         /// Filter by category: preference, aversion, habit, style, taboo (or aliases: love, hate)
         #[arg(long = "type", short = 't')]
         kind: Option<String>,
+        /// Do not refresh last_seen for matched entries
+        #[arg(long)]
+        no_touch: bool,
     },
 
     /// Show top-N preferences by current effective weight
@@ -138,6 +157,50 @@ fn canonical_category(s: &str) -> Result<&'static str> {
     Ok(resolve_category(s)?.0)
 }
 
+/// FNV-1a 64-bit hash — stable, dependency-free, good enough for dedup.
+fn content_hash(s: &str) -> String {
+    const OFFSET: u64 = 14695981039346656037;
+    const PRIME: u64 = 1099511628211;
+    let mut h = OFFSET;
+    for byte in s.bytes() {
+        h ^= byte as u64;
+        h = h.wrapping_mul(PRIME);
+    }
+    format!("{h:016x}")
+}
+
+fn read_text(file: Option<PathBuf>) -> Result<String> {
+    let text = match file {
+        Some(p) => std::fs::read_to_string(&p)?,
+        None => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            buf
+        }
+    };
+    if text.trim().is_empty() {
+        anyhow::bail!("no session text provided");
+    }
+    Ok(text)
+}
+
+fn profile_context(db: &Db) -> Result<Option<String>> {
+    let prefs = db.top(20, None)?;
+    Ok(if prefs.is_empty() {
+        None
+    } else {
+        Some(format_profile_context(&prefs))
+    })
+}
+
+fn format_profile_context(prefs: &[Preference]) -> String {
+    prefs
+        .iter()
+        .map(|p| format!("[{}] {} ({:.1}): {}", p.category, p.item, p.base_score, p.reason))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn print_entries(entries: &[Preference]) {
     println!("{}", serde_json::to_string_pretty(entries).unwrap());
 }
@@ -189,33 +252,46 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Analyze { file } => {
-            let text = match file {
-                Some(p) => std::fs::read_to_string(&p)?,
-                None => {
-                    let mut buf = String::new();
-                    std::io::stdin().read_to_string(&mut buf)?;
-                    buf
-                }
-            };
-            if text.trim().is_empty() {
-                anyhow::bail!("no session text provided");
+            let text = read_text(file)?;
+
+            let hash = content_hash(&text);
+            if db.has_analyzed(&hash)? {
+                eprintln!("Session already analyzed (hash {hash}), skipping.");
+                return Ok(());
             }
 
-            let api_key = analyzer::api_key_from_env()?;
-            eprintln!("Analyzing with flash LLM (claude-haiku-4-5)…");
-            let result = analyzer::analyze(&text, &api_key)?;
+            let existing_profile = profile_context(&db)?;
+
+            eprintln!("Analyzing…");
+            let result = analyzer::analyze(&text, existing_profile.as_deref())?;
 
             for e in &result.entries {
                 db.upsert(&e.category, &e.item, &e.reason, &e.keywords, e.base_score, "analysis")?;
             }
-            db.log_session(result.entries.len())?;
-
+            db.log_session(result.entries.len(), &hash)?;
             print_analyze_summary(&result.entries);
         }
 
-        Command::Recall { query, kind } => {
+        Command::Extract { file } => {
+            let text = read_text(file)?;
+            let existing_profile = profile_context(&db)?;
+            print!("{}", analyzer::extraction_prompt(&text, existing_profile.as_deref()));
+        }
+
+        Command::Import => {
+            let mut buf = String::new();
+            std::io::stdin().read_to_string(&mut buf)?;
+            let result = analyzer::parse_result(&buf)?;
+            for e in &result.entries {
+                db.upsert(&e.category, &e.item, &e.reason, &e.keywords, e.base_score, "analysis")?;
+            }
+            db.log_session(result.entries.len(), "")?;
+            print_analyze_summary(&result.entries);
+        }
+
+        Command::Recall { query, kind, no_touch } => {
             let cat = kind.as_deref().map(canonical_category).transpose()?;
-            let prefs = db.recall(&query, cat)?;
+            let prefs = db.recall(&query, cat, !no_touch)?;
             if prefs.is_empty() {
                 let scope = cat.map(|c| format!(" in [{c}]")).unwrap_or_default();
                 println!("No preferences matched \"{query}\"{scope}.");
