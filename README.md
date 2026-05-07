@@ -113,6 +113,7 @@ aizo [--db <path>] <COMMAND>
 | `top [N]` | Top-N entries by effective weight (default 10) |
 | `show` | Full profile as JSON, sorted by effective weight |
 | `add <category> <item> <reason…>` | Manually add or update a preference |
+| `touch <category> <item…>` | Reset decay clock without changing score |
 | `remove <category> <item…>` | Hard-remove an entry |
 | `clear` | Wipe entire profile and session history |
 | `info` | DB path, per-category counts, decay settings |
@@ -258,6 +259,7 @@ The skill defines six triggers:
 | 4 | User states an explicit rule | `aizo add taboo/preference …` | Sync, immediate |
 | 5 | About to generate on topic X | `aizo recall <X>` | Sync, before generation |
 | 6 | Session ends | `aizo analyze <transcript>` | Async, background |
+| 7 | Daily cron job | Agent LLM scans logs → `aizo touch` confirmed items | Scheduled, background |
 
 **Key rules encoded in the skill:**
 - Taboos always win over preferences in conflicts

@@ -199,6 +199,18 @@ impl Db {
         Ok(())
     }
 
+    /// Reset the decay clock for one entry without changing its score or reason.
+    /// Returns true if the entry was found and updated, false if not found.
+    pub fn touch(&self, category: &str, item: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let n = self.conn.execute(
+            "UPDATE preferences SET last_seen = ?1
+             WHERE category = ?2 AND LOWER(item) = LOWER(?3)",
+            params![now, category, item],
+        )?;
+        Ok(n > 0)
+    }
+
     pub fn remove(&self, category: &str, item: &str) -> Result<bool> {
         let n = self.conn.execute(
             "DELETE FROM preferences WHERE category = ?1 AND LOWER(item) = LOWER(?2)",

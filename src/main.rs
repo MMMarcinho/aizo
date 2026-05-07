@@ -69,6 +69,18 @@ enum Command {
         reason: Vec<String>,
     },
 
+    /// Refresh the decay clock of an existing entry without changing its score
+    ///
+    /// Call this when the agent confirms a preference was just demonstrated,
+    /// without needing to re-analyze the full session through the LLM.
+    Touch {
+        /// Category: preference|love, aversion|hate, habit, style, taboo
+        category: String,
+        /// Item label to refresh (case-insensitive, remaining words joined)
+        #[arg(trailing_var_arg = true, num_args = 1..)]
+        item: Vec<String>,
+    },
+
     /// Remove a preference by category and item label
     Remove {
         /// Category: preference|love, aversion|hate, habit, style, taboo
@@ -240,6 +252,20 @@ fn main() -> Result<()> {
             let reason_str = reason.join(" ");
             db.upsert(cat, &item, &reason_str, &[], default_score, "manual")?;
             println!("Added [{cat}]: \"{item}\" (base_score {default_score:.1})");
+        }
+
+        Command::Touch { category, item } => {
+            let (cat, _) = resolve_category(&category)?;
+            let item_str = item.join(" ");
+            if item_str.is_empty() {
+                anyhow::bail!("usage: aizo touch <category> <item…>");
+            }
+            let found = db.touch(cat, &item_str)?;
+            if found {
+                println!("Touched [{cat}]: \"{item_str}\" — decay clock reset.");
+            } else {
+                println!("Not found: [{cat}] \"{item_str}\"");
+            }
         }
 
         Command::Remove { category, item } => {
