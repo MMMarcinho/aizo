@@ -118,6 +118,16 @@ enum Command {
         item: Vec<String>,
     },
 
+    /// List all keywords stored in the database with entry counts
+    Keywords {
+        /// Sort order: count (default) or alpha
+        #[arg(long, default_value = "count")]
+        sort: String,
+        /// Filter by category: preference, aversion, habit, style, taboo (or aliases: love, hate)
+        #[arg(long = "type", short = 't')]
+        kind: Option<String>,
+    },
+
     /// Interactive first-time setup: configure LLM provider and write ~/.aizo/.env
     Init,
 
@@ -179,6 +189,19 @@ fn content_hash(s: &str) -> String {
         h = h.wrapping_mul(PRIME);
     }
     format!("{h:016x}")
+}
+
+/// Load ~/.aizo/taxonomy.txt — one keyword per line, # = comment, blank lines ignored.
+fn load_taxonomy() -> Option<Vec<String>> {
+    let path = home_dir()?.join(".aizo").join("taxonomy.txt");
+    let content = std::fs::read_to_string(path).ok()?;
+    let terms: Vec<String> = content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect();
+    if terms.is_empty() { None } else { Some(terms) }
 }
 
 fn read_text(file: Option<PathBuf>) -> Result<String> {
@@ -414,6 +437,61 @@ fn main() -> Result<()> {
     let db = Db::open(&db_path)?;
 
     match cli.command {
+        Command::Keywords { sort, kind } => {
+            let cat = kind.as_deref().map(canonical_category).transpose()?;
+            let mut kws = db.all_keywords(cat)?;
+
+            if sort == "alpha" {
+                kws.sort_by(|a, b| a.0.cmp(&b.0));
+            } else {
+                kws.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            }
+
+            if kws.is_empty() {
+                println!("No keywords stored yet.");
+            } else {
+                let taxonomy = load_taxonomy();
+                match &taxonomy {
+                    Some(terms) => {
+                        let term_set: std::collections::HashSet<&str> =
+                            terms.iter().map(String::as_str).collect();
+                        let active: std::collections::HashSet<&str> =
+                            kws.iter().map(|(k, _)| k.as_str()).collect();
+                        let active_count = kws.iter().filter(|(k, _)| term_set.contains(k.as_str())).count();
+                        println!("Taxonomy coverage: {active_count} / {} terms active\n", terms.len());
+
+                        println!("  {:<28}  entries", "keyword");
+                        println!("  {}", "─".repeat(40));
+
+                        // taxonomy terms first (active then unused)
+                        for term in terms {
+                            if let Some((_, n)) = kws.iter().find(|(k, _)| k == term) {
+                                println!("  {:<28}  {n}", term);
+                            } else {
+                                println!("  {:<28}  —", term);
+                            }
+                        }
+                        // free-form keywords not in taxonomy
+                        let extras: Vec<_> = kws.iter().filter(|(k, _)| !term_set.contains(k.as_str())).collect();
+                        if !extras.is_empty() {
+                            println!("\n  [not in taxonomy]");
+                            for (kw, n) in &extras {
+                                println!("  {:<28}  {n}", kw);
+                            }
+                        }
+                        let _ = active;
+                    }
+                    None => {
+                        println!("  {:<28}  entries", "keyword");
+                        println!("  {}", "─".repeat(40));
+                        for (kw, n) in &kws {
+                            println!("  {:<28}  {n}", kw);
+                        }
+                    }
+                }
+            }
+        }
+
         Command::Init => {
             cmd_init(&db_path)?;
         }
@@ -428,9 +506,10 @@ fn main() -> Result<()> {
             }
 
             let existing_profile = profile_context(&db)?;
+            let taxonomy = load_taxonomy();
 
             eprintln!("Analyzing…");
-            let result = analyzer::analyze(&text, existing_profile.as_deref())?;
+            let result = analyzer::analyze(&text, existing_profile.as_deref(), taxonomy.as_deref())?;
 
             for e in &result.entries {
                 db.upsert(&e.category, &e.item, &e.reason, &e.keywords, e.base_score, "analysis")?;
@@ -442,7 +521,8 @@ fn main() -> Result<()> {
         Command::Extract { file } => {
             let text = read_text(file)?;
             let existing_profile = profile_context(&db)?;
-            print!("{}", analyzer::extraction_prompt(&text, existing_profile.as_deref()));
+            let taxonomy = load_taxonomy();
+            print!("{}", analyzer::extraction_prompt(&text, existing_profile.as_deref(), taxonomy.as_deref()));
         }
 
         Command::Import => {

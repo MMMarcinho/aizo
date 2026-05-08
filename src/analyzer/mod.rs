@@ -62,14 +62,21 @@ pub struct ExtractionResult {
 
 // ── Prompt construction ───────────────────────────────────────────────────────
 
-fn build_system(existing_profile: Option<&str>) -> String {
-    match existing_profile {
-        Some(p) => format!(
-            "{}\n\nAlready-stored preferences (reference only — skip re-extracting unless meaningfully changed):\n{}",
-            SYSTEM_PROMPT, p
-        ),
-        None => SYSTEM_PROMPT.to_string(),
+fn build_system(existing_profile: Option<&str>, taxonomy: Option<&[String]>) -> String {
+    let mut out = SYSTEM_PROMPT.to_string();
+    if let Some(terms) = taxonomy {
+        if !terms.is_empty() {
+            out.push_str(
+                "\n\nKeyword taxonomy — select keywords ONLY from this list (do not invent new ones):\n",
+            );
+            out.push_str(&terms.join(", "));
+        }
     }
+    if let Some(p) = existing_profile {
+        out.push_str("\n\nAlready-stored preferences (reference only — skip re-extracting unless meaningfully changed):\n");
+        out.push_str(p);
+    }
+    out
 }
 
 fn build_user(session_text: &str) -> String {
@@ -80,8 +87,8 @@ fn build_user(session_text: &str) -> String {
 ///
 /// Suitable for piping to any CLI LLM or pasting into a chat UI.
 /// The model's response should be piped to `aizo import`.
-pub fn extraction_prompt(session_text: &str, existing_profile: Option<&str>) -> String {
-    format!("{}\n\n{}", build_system(existing_profile), build_user(session_text))
+pub fn extraction_prompt(session_text: &str, existing_profile: Option<&str>, taxonomy: Option<&[String]>) -> String {
+    format!("{}\n\n{}", build_system(existing_profile, taxonomy), build_user(session_text))
 }
 
 // ── Result parsing ────────────────────────────────────────────────────────────
@@ -131,8 +138,7 @@ fn use_anthropic_format() -> bool {
 
 /// Send a minimal request to verify the LLM is reachable and the key works.
 pub fn test_connection() -> Result<()> {
-    // A bare greeting produces {"entries":[]} — valid JSON, no side effects.
-    analyze("User: hi", None)?;
+    analyze("User: hi", None, None)?;
     Ok(())
 }
 
@@ -145,7 +151,7 @@ pub fn test_connection() -> Result<()> {
 ///   AIZO_API_FORMAT — "anthropic" to force Anthropic wire format; otherwise OpenAI-compatible
 ///
 /// For no-LLM workflows, use `aizo extract | <llm> | aizo import` instead.
-pub fn analyze(session_text: &str, existing_profile: Option<&str>) -> Result<ExtractionResult> {
+pub fn analyze(session_text: &str, existing_profile: Option<&str>, taxonomy: Option<&[String]>) -> Result<ExtractionResult> {
     let anthropic = use_anthropic_format();
 
     let model = std::env::var("AIZO_MODEL").unwrap_or_else(|_| {
@@ -169,9 +175,9 @@ pub fn analyze(session_text: &str, existing_profile: Option<&str>) -> Result<Ext
     }
 
     let raw = if anthropic {
-        call_anthropic(&model, session_text, existing_profile)?
+        call_anthropic(&model, session_text, existing_profile, taxonomy)?
     } else {
-        call_openai(&model, session_text, existing_profile)?
+        call_openai(&model, session_text, existing_profile, taxonomy)?
     };
 
     parse_result(&raw)
@@ -179,7 +185,7 @@ pub fn analyze(session_text: &str, existing_profile: Option<&str>) -> Result<Ext
 
 // ── Wire formats ──────────────────────────────────────────────────────────────
 
-fn call_openai(model: &str, session_text: &str, existing_profile: Option<&str>) -> Result<String> {
+fn call_openai(model: &str, session_text: &str, existing_profile: Option<&str>, taxonomy: Option<&[String]>) -> Result<String> {
     let api_url = std::env::var("AIZO_API_URL")
         .unwrap_or_else(|_| OPENAI_DEFAULT_URL.to_string());
     let api_key = std::env::var("AIZO_API_KEY")
@@ -202,7 +208,7 @@ fn call_openai(model: &str, session_text: &str, existing_profile: Option<&str>) 
         model: model.to_string(),
         max_tokens: 1024,
         messages: vec![
-            Msg { role: "system", content: build_system(existing_profile) },
+            Msg { role: "system", content: build_system(existing_profile, taxonomy) },
             Msg { role: "user",   content: build_user(session_text) },
         ],
     };
@@ -227,7 +233,7 @@ fn call_openai(model: &str, session_text: &str, existing_profile: Option<&str>) 
         .context("empty choices in API response")
 }
 
-fn call_anthropic(model: &str, session_text: &str, existing_profile: Option<&str>) -> Result<String> {
+fn call_anthropic(model: &str, session_text: &str, existing_profile: Option<&str>, taxonomy: Option<&[String]>) -> Result<String> {
     let api_url = std::env::var("AIZO_API_URL")
         .unwrap_or_else(|_| ANTHROPIC_DEFAULT_URL.to_string());
     let api_key = std::env::var("AIZO_API_KEY")
@@ -246,7 +252,7 @@ fn call_anthropic(model: &str, session_text: &str, existing_profile: Option<&str
     let body = Req {
         model: model.to_string(),
         max_tokens: 1024,
-        system: build_system(existing_profile),
+        system: build_system(existing_profile, taxonomy),
         messages: vec![Msg { role: "user", content: build_user(session_text) }],
     };
 
