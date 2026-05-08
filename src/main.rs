@@ -58,6 +58,9 @@ enum Command {
         /// Do not refresh last_seen for matched entries
         #[arg(long)]
         no_touch: bool,
+        /// Output raw JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show top-N preferences by current effective weight
@@ -68,13 +71,19 @@ enum Command {
         /// Filter by category: preference, aversion, habit, style, taboo (or aliases: love, hate)
         #[arg(long = "type", short = 't')]
         kind: Option<String>,
+        /// Output raw JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
     },
 
-    /// Print the full preference profile as JSON, sorted by effective weight
+    /// Print the full preference profile sorted by effective weight
     Show {
         /// Filter by category: preference, aversion, habit, style, taboo (or aliases: love, hate)
         #[arg(long = "type", short = 't')]
         kind: Option<String>,
+        /// Output raw JSON instead of human-readable text
+        #[arg(long)]
+        json: bool,
     },
 
     /// Manually add or update a preference
@@ -204,8 +213,31 @@ fn format_profile_context(prefs: &[Preference]) -> String {
         .join("\n")
 }
 
-fn print_entries(entries: &[Preference]) {
-    println!("{}", serde_json::to_string_pretty(entries).unwrap());
+fn print_entries(entries: &[Preference], json: bool) {
+    if json {
+        println!("{}", serde_json::to_string_pretty(entries).unwrap());
+        return;
+    }
+
+    // Summary line
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for e in entries {
+        *counts.entry(e.category.as_str()).or_insert(0) += 1;
+    }
+    let summary = ["preference", "aversion", "habit", "style", "taboo"]
+        .iter()
+        .filter_map(|cat| counts.get(cat).map(|n| format!("{n} {cat}(s)")))
+        .collect::<Vec<_>>()
+        .join("  ·  ");
+    println!("{summary}");
+    println!();
+
+    for e in entries {
+        println!(
+            "  [{:<10}]  {:<26}  {:>4.1}   {}",
+            e.category, e.item, e.effective_weight, e.reason
+        );
+    }
 }
 
 fn print_analyze_summary(entries: &[analyzer::ExtractedEntry]) {
@@ -424,34 +456,34 @@ fn main() -> Result<()> {
             print_analyze_summary(&result.entries);
         }
 
-        Command::Recall { query, kind, no_touch } => {
+        Command::Recall { query, kind, no_touch, json } => {
             let cat = kind.as_deref().map(canonical_category).transpose()?;
             let prefs = db.recall(&query, cat, !no_touch)?;
             if prefs.is_empty() {
                 let scope = cat.map(|c| format!(" in [{c}]")).unwrap_or_default();
                 println!("No preferences matched \"{query}\"{scope}.");
             } else {
-                print_entries(&prefs);
+                print_entries(&prefs, json);
             }
         }
 
-        Command::Top { n, kind } => {
+        Command::Top { n, kind, json } => {
             let cat = kind.as_deref().map(canonical_category).transpose()?;
             let prefs = db.top(n, cat)?;
             if prefs.is_empty() {
                 println!("No preferences recorded yet.");
             } else {
-                print_entries(&prefs);
+                print_entries(&prefs, json);
             }
         }
 
-        Command::Show { kind } => {
+        Command::Show { kind, json } => {
             let cat = kind.as_deref().map(canonical_category).transpose()?;
             let prefs = db.all(cat)?;
             if prefs.is_empty() {
                 println!("No preferences recorded yet.");
             } else {
-                print_entries(&prefs);
+                print_entries(&prefs, json);
             }
         }
 
