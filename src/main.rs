@@ -87,20 +87,24 @@ enum Command {
     },
 
     /// Manually add or update a preference
+    ///
+    /// Category is inferred from --score when --type is omitted:
+    ///   0.0–1.5 → taboo, 1.6–4.0 → aversion, 4.1–6.5 → habit, 6.6–10.0 → preference
     Add {
-        /// Category: preference|love, aversion|hate, habit, style, taboo
-        category: String,
         /// Short item label (e.g. "dark mode", "verbose comments")
         item: String,
         /// One-sentence reason (remaining words joined)
         #[arg(trailing_var_arg = true, num_args = 1..)]
         reason: Vec<String>,
+        /// Base score 0.0–10.0; category is inferred when --type is omitted
+        #[arg(long, short = 's')]
+        score: Option<f64>,
+        /// Explicit category: preference|love, aversion|hate, habit, style, taboo
+        #[arg(long = "type", short = 't')]
+        kind: Option<String>,
         /// Comma-separated synonym keywords for richer recall (e.g. concise,brevity,minimal)
         #[arg(long, value_delimiter = ',')]
         keywords: Vec<String>,
-        /// Override the base score (0.0–10.0); defaults to category default
-        #[arg(long, short = 's')]
-        score: Option<f64>,
     },
 
     /// Add or replace keywords on an existing entry without changing its score or reason
@@ -194,6 +198,14 @@ fn resolve_category(s: &str) -> Result<(&'static str, f64)> {
 
 fn canonical_category(s: &str) -> Result<&'static str> {
     Ok(resolve_category(s)?.0)
+}
+
+/// Infer category from score when the user doesn't specify one.
+fn infer_category(score: f64) -> &'static str {
+    if score <= 1.5 { "taboo" }
+    else if score <= 4.0 { "aversion" }
+    else if score <= 6.5 { "habit" }
+    else { "preference" }
 }
 
 /// FNV-1a 64-bit hash — stable, dependency-free, good enough for dedup.
@@ -700,15 +712,18 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Add { category, item, reason, keywords, score } => {
-            let (cat, default_score) = resolve_category(&category)?;
+        Command::Add { item, reason, score, kind, keywords } => {
             if reason.is_empty() {
-                anyhow::bail!("usage: aizo add <category> <item> <reason…> [--score 0-10] [--keywords k1,k2,…]");
+                anyhow::bail!("usage: aizo add <item> <reason…> [--score 0-10] [--type category] [--keywords k1,k2,…]");
             }
             let base_score = match score {
                 Some(s) if (0.0..=10.0).contains(&s) => s,
                 Some(s) => anyhow::bail!("--score must be between 0.0 and 10.0, got {s}"),
-                None => default_score,
+                None => kind.as_deref().map(|k| resolve_category(k).map(|(_, s)| s)).transpose()?.unwrap_or(9.0),
+            };
+            let cat = match kind.as_deref() {
+                Some(k) => resolve_category(k)?.0,
+                None => infer_category(base_score),
             };
             let reason_str = reason.join(" ");
             let kws: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
