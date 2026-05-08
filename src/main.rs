@@ -218,19 +218,126 @@ fn load_taxonomy() -> Option<Vec<String>> {
     if terms.is_empty() { None } else { Some(terms) }
 }
 
+/// Flatten a JSON conversation export into plain "Speaker: text" lines.
+///
+/// Supports:
+///   - Array of message objects (OpenAI, generic)
+///   - Object with a "messages" or "conversation" key containing such an array
+///   - Claude claude.ai export: each message has `content` as an array of typed blocks
+///   - JSONL: one message object per line
+fn json_to_session_text(raw: &str) -> Option<String> {
+    fn extract_content(msg: &serde_json::Value) -> Option<String> {
+        if let Some(c) = msg.get("content") {
+            return match c {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Array(blocks) => {
+                    let text = blocks
+                        .iter()
+                        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if text.is_empty() { None } else { Some(text) }
+                }
+                _ => None,
+            };
+        }
+        // fallback field names used in some exports
+        msg.get("text")
+            .or_else(|| msg.get("message"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    }
+
+    fn speaker(msg: &serde_json::Value) -> &str {
+        let role = msg
+            .get("role")
+            .or_else(|| msg.get("sender"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        match role {
+            "human" | "user" => "User",
+            "assistant" | "ai" | "claude" => "Assistant",
+            other => other,
+        }
+    }
+
+    fn msgs_to_lines(arr: &[serde_json::Value]) -> Vec<String> {
+        arr.iter()
+            .filter_map(|msg| {
+                let content = extract_content(msg)?;
+                let content = content.trim();
+                if content.is_empty() { return None; }
+                Some(format!("{}: {content}", speaker(msg)))
+            })
+            .collect()
+    }
+
+    // Try JSONL first (multiple JSON objects, one per line)
+    let jsonl_lines: Vec<serde_json::Value> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    if jsonl_lines.len() > 1 {
+        let lines = msgs_to_lines(&jsonl_lines);
+        if !lines.is_empty() {
+            return Some(lines.join("\n\n"));
+        }
+    }
+
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let arr: &[serde_json::Value] = match &v {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(obj) => {
+            if let Some(serde_json::Value::Array(a)) =
+                obj.get("messages").or_else(|| obj.get("conversation"))
+            {
+                a
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    let lines = msgs_to_lines(arr);
+    if lines.is_empty() { None } else { Some(lines.join("\n\n")) }
+}
+
 fn read_text(file: Option<PathBuf>) -> Result<String> {
-    let text = match file {
-        Some(p) => std::fs::read_to_string(&p)?,
+    let (raw, hint_json) = match file {
+        Some(ref p) => {
+            let is_json = matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("json" | "jsonl")
+            );
+            (std::fs::read_to_string(p)?, is_json)
+        }
         None => {
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
-            buf
+            let trimmed = buf.trim_start();
+            let looks_json = trimmed.starts_with('{') || trimmed.starts_with('[');
+            (buf, looks_json)
         }
     };
-    if text.trim().is_empty() {
+
+    if raw.trim().is_empty() {
         anyhow::bail!("no session text provided");
     }
-    Ok(text)
+
+    if hint_json {
+        match json_to_session_text(&raw) {
+            Some(text) => return Ok(text),
+            None => eprintln!(
+                "Warning: JSON input could not be parsed as a conversation; \
+                 sending raw content to the LLM."
+            ),
+        }
+    }
+
+    Ok(raw)
 }
 
 fn profile_context(db: &Db) -> Result<Option<String>> {
@@ -669,6 +776,7 @@ fn main() -> Result<()> {
             println!("  AIZO_API_URL    : {}", std::env::var("AIZO_API_URL").unwrap_or_else(|_| "(not set)".into()));
             println!("  AIZO_API_FORMAT : {}", std::env::var("AIZO_API_FORMAT").unwrap_or_else(|_| "(not set)".into()));
             println!("  AIZO_AUTO_KEYWORDS   : {}", std::env::var("AIZO_AUTO_KEYWORDS").unwrap_or_else(|_| "false (default)".into()));
+            println!("  AIZO_MAX_TOKENS      : {}", std::env::var("AIZO_MAX_TOKENS").unwrap_or_else(|_| "2048 (default)".into()));
             println!("Total       : {}", stats.total());
             println!("  preference: {}", stats.preferences);
             println!("  aversion  : {}", stats.aversions);
