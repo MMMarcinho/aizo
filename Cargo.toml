@@ -2,7 +2,14 @@
 name = "aizo"
 version = "0.1.0"
 edition = "2021"
-description = "爱憎 — user preference profiler for AI agents (love & hate recall via flash LLM)"
+description = "爱憎 — preference memory for AI agents: extract, decay, and recall user likes and dislikes via flash LLM + SQLite"
+license = "MIT"
+repository = "https://github.com/mmmarcinho/aizo"
+homepage = "https://github.com/mmmarcinho/aizo"
+readme = "README.md"
+keywords = ["ai", "agent", "memory", "preferences", "llm"]
+categories = ["command-line-utilities"]
+authors = ["mmmarcinho"]
 
 [[bin]]
 name = "aizo"
