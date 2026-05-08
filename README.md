@@ -1,5 +1,7 @@
 # aizo 爱憎
 
+[中文文档](README.zh.md)
+
 **aizo** (爱憎, *ài zēng*, "love and hate") is a lightweight, high-performance preference memory system for AI agents, built entirely in Rust.
 
 It mimics human cognitive memory: rather than storing full conversation transcripts, it continuously **extracts, quantifies, decays, and recalls** a user's stable preferences, aversions, habits, communication styles, and hard limits from interaction history. The result is a compact, numerically-weighted personality profile that any agent can query in milliseconds.
