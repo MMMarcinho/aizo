@@ -129,6 +129,13 @@ fn use_anthropic_format() -> bool {
         && std::env::var("ANTHROPIC_API_KEY").is_ok()
 }
 
+/// Send a minimal request to verify the LLM is reachable and the key works.
+pub fn test_connection() -> Result<()> {
+    // A bare greeting produces {"entries":[]} — valid JSON, no side effects.
+    analyze("User: hi", None)?;
+    Ok(())
+}
+
 /// Call the configured LLM to extract preferences from a session transcript.
 ///
 /// Configuration (env vars):
