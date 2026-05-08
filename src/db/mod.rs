@@ -112,17 +112,31 @@ impl Db {
         ")?;
 
         if version < 3 {
-            self.conn.execute_batch(
-                "ALTER TABLE preferences ADD COLUMN keywords TEXT NOT NULL DEFAULT '';",
-            )?;
+            let has_kw: bool = self.conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('preferences') WHERE name='keywords'")?
+                .query_row([], |r| r.get::<_, i64>(0))
+                .unwrap_or(0) > 0;
+            if !has_kw {
+                self.conn.execute_batch(
+                    "ALTER TABLE preferences ADD COLUMN keywords TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
         }
 
         if version < 4 {
-            self.conn.execute_batch("
-                ALTER TABLE sessions ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_hash
-                    ON sessions(content_hash) WHERE content_hash != '';
-            ")?;
+            let has_hash: bool = self.conn
+                .prepare("SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='content_hash'")?
+                .query_row([], |r| r.get::<_, i64>(0))
+                .unwrap_or(0) > 0;
+            if !has_hash {
+                self.conn.execute_batch(
+                    "ALTER TABLE sessions ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';",
+                )?;
+            }
+            self.conn.execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_hash
+                    ON sessions(content_hash) WHERE content_hash != '';",
+            )?;
         }
 
         self.set_version(4)?;

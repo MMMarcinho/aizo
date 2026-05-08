@@ -245,7 +245,18 @@ fn print_analyze_summary(entries: &[analyzer::ExtractedEntry]) {
     }
 }
 
+fn load_env() -> (bool, bool) {
+    // Load user config first, then project override (later loads don't overwrite earlier ones).
+    // Shell env always wins — dotenvy never overwrites already-set variables.
+    let user_env = home_dir()
+        .map(|h| dotenvy::from_path(h.join(".aizo").join(".env")).is_ok())
+        .unwrap_or(false);
+    let project_env = dotenvy::dotenv().is_ok();
+    (user_env, project_env)
+}
+
 fn main() -> Result<()> {
+    let (user_env, project_env) = load_env();
     let cli = Cli::parse();
     let db_path = cli.db.unwrap_or_else(default_db_path);
     let db = Db::open(&db_path)?;
@@ -367,6 +378,12 @@ fn main() -> Result<()> {
             let stats = db.stats()?;
             let cfg = db.get_decay_config()?;
             println!("Database    : {}", db_path.display());
+            println!("Config");
+            println!("  ~/.aizo/.env : {}", if user_env    { "loaded" } else { "not found" });
+            println!("  ./.env       : {}", if project_env { "loaded" } else { "not found" });
+            println!("  AIZO_MODEL   : {}", std::env::var("AIZO_MODEL").unwrap_or_else(|_| "(not set)".into()));
+            println!("  AIZO_API_URL : {}", std::env::var("AIZO_API_URL").unwrap_or_else(|_| "(not set)".into()));
+            println!("  AIZO_API_FORMAT : {}", std::env::var("AIZO_API_FORMAT").unwrap_or_else(|_| "(not set)".into()));
             println!("Total       : {}", stats.total());
             println!("  preference: {}", stats.preferences);
             println!("  aversion  : {}", stats.aversions);
