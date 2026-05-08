@@ -9,11 +9,10 @@ use crate::scoring::{self, DecayConfig};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preference {
     pub id: i64,
-    pub category: String,       // preference | aversion | habit | style | taboo
     pub item: String,
     pub reason: String,
     pub keywords: Vec<String>,  // synonym/related-term tags for richer recall
-    pub base_score: f64,        // 0–10: 0 = hard aversion/taboo, 10 = strong preference
+    pub base_score: f64,        // 0–10: 0 = hard limit, 10 = strong love
     pub source: String,         // "analysis" | "manual"
     pub added_at: String,
     pub last_seen: String,      // reset on every reinforcement; drives decay clock
@@ -78,21 +77,8 @@ impl Db {
             ")?;
         }
 
+        // Ensure supporting tables always exist
         self.conn.execute_batch("
-            CREATE TABLE IF NOT EXISTS preferences (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                category    TEXT    NOT NULL
-                    CHECK(category IN ('preference','aversion','habit','style','taboo')),
-                item        TEXT    NOT NULL,
-                reason      TEXT    NOT NULL,
-                base_score  REAL    NOT NULL DEFAULT 5.0,
-                source      TEXT    NOT NULL DEFAULT 'manual',
-                added_at    TEXT    NOT NULL,
-                last_seen   TEXT    NOT NULL
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_pref_cat_item
-                ON preferences(category, LOWER(item));
-
             CREATE TABLE IF NOT EXISTS decay_config (
                 id              INTEGER PRIMARY KEY CHECK(id = 1),
                 half_life_days  REAL    NOT NULL DEFAULT 30.0,
@@ -111,35 +97,76 @@ impl Db {
                 ON sessions(content_hash) WHERE content_hash != '';
         ")?;
 
-        if version < 3 {
-            let has_kw: bool = self.conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('preferences') WHERE name='keywords'")?
-                .query_row([], |r| r.get::<_, i64>(0))
+        if version < 5 {
+            // Rebuild preferences table: drop category, unique on LOWER(item) only.
+            // For any duplicate items (same item under different old categories),
+            // keep the row whose base_score is furthest from neutral (5.0).
+            self.conn.execute_batch("
+                CREATE TABLE IF NOT EXISTS preferences_v5 (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item        TEXT    NOT NULL,
+                    reason      TEXT    NOT NULL,
+                    keywords    TEXT    NOT NULL DEFAULT '',
+                    base_score  REAL    NOT NULL DEFAULT 5.0,
+                    source      TEXT    NOT NULL DEFAULT 'manual',
+                    added_at    TEXT    NOT NULL,
+                    last_seen   TEXT    NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_pref_item_v5
+                    ON preferences_v5(LOWER(item));
+            ")?;
+
+            // Copy from old table if it exists (versions 2–4 had category column).
+            let old_exists: bool = self.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='preferences'",
+                    [],
+                    |r| r.get::<_, i64>(0),
+                )
                 .unwrap_or(0) > 0;
-            if !has_kw {
-                self.conn.execute_batch(
-                    "ALTER TABLE preferences ADD COLUMN keywords TEXT NOT NULL DEFAULT '';",
-                )?;
+
+            if old_exists {
+                // Order by extremity so INSERT OR IGNORE keeps the most salient entry
+                // when the same item appeared under multiple old categories.
+                self.conn.execute_batch("
+                    INSERT OR IGNORE INTO preferences_v5
+                        (item, reason, keywords, base_score, source, added_at, last_seen)
+                    SELECT item,
+                           reason,
+                           COALESCE(keywords, ''),
+                           base_score,
+                           source,
+                           added_at,
+                           last_seen
+                    FROM preferences
+                    ORDER BY ABS(base_score - 5.0) DESC, last_seen DESC;
+
+                    DROP TABLE preferences;
+                ")?;
             }
+
+            self.conn.execute_batch("
+                ALTER TABLE preferences_v5 RENAME TO preferences;
+            ")?;
+        } else {
+            // Fresh database at v5+: create the table directly
+            self.conn.execute_batch("
+                CREATE TABLE IF NOT EXISTS preferences (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item        TEXT    NOT NULL,
+                    reason      TEXT    NOT NULL,
+                    keywords    TEXT    NOT NULL DEFAULT '',
+                    base_score  REAL    NOT NULL DEFAULT 5.0,
+                    source      TEXT    NOT NULL DEFAULT 'manual',
+                    added_at    TEXT    NOT NULL,
+                    last_seen   TEXT    NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_pref_item
+                    ON preferences(LOWER(item));
+            ")?;
         }
 
-        if version < 4 {
-            let has_hash: bool = self.conn
-                .prepare("SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='content_hash'")?
-                .query_row([], |r| r.get::<_, i64>(0))
-                .unwrap_or(0) > 0;
-            if !has_hash {
-                self.conn.execute_batch(
-                    "ALTER TABLE sessions ADD COLUMN content_hash TEXT NOT NULL DEFAULT '';",
-                )?;
-            }
-            self.conn.execute_batch(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_hash
-                    ON sessions(content_hash) WHERE content_hash != '';",
-            )?;
-        }
-
-        self.set_version(4)?;
+        self.set_version(5)?;
         Ok(())
     }
 
@@ -165,20 +192,19 @@ impl Db {
 
     // ── Row hydration ────────────────────────────────────────────────────────
 
-    // SELECT column order: id(0) category(1) item(2) reason(3)
-    //                      keywords(4) base_score(5) source(6) added_at(7) last_seen(8)
+    // SELECT column order: id(0) item(1) reason(2) keywords(3) base_score(4)
+    //                      source(5) added_at(6) last_seen(7)
     fn hydrate(row: &rusqlite::Row, cfg: &DecayConfig) -> rusqlite::Result<Preference> {
-        let last_seen: String = row.get(8)?;
-        let keywords_raw: String = row.get(4)?;
-        let base_score: f64 = row.get(5)?;
+        let last_seen: String = row.get(7)?;
+        let keywords_raw: String = row.get(3)?;
+        let base_score: f64 = row.get(4)?;
 
         let s = scoring::compute(base_score, &last_seen, cfg);
 
         Ok(Preference {
             id:                row.get(0)?,
-            category:          row.get(1)?,
-            item:              row.get(2)?,
-            reason:            row.get(3)?,
+            item:              row.get(1)?,
+            reason:            row.get(2)?,
             keywords: keywords_raw
                 .split(',')
                 .map(str::trim)
@@ -186,8 +212,8 @@ impl Db {
                 .map(String::from)
                 .collect(),
             base_score,
-            source:            row.get(6)?,
-            added_at:          row.get(7)?,
+            source:            row.get(5)?,
+            added_at:          row.get(6)?,
             last_seen,
             score_exponent:    s.score_exponent,
             decay_coefficient: s.decay_coefficient,
@@ -200,7 +226,6 @@ impl Db {
     /// Upsert with score smoothing (new = old×0.4 + incoming×0.6) and last_seen refresh.
     pub fn upsert(
         &self,
-        category: &str,
         item: &str,
         reason: &str,
         keywords: &[String],
@@ -211,15 +236,15 @@ impl Db {
         let kw = keywords.join(", ");
         self.conn.execute(
             "INSERT INTO preferences
-                (category, item, reason, keywords, base_score, source, added_at, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
-             ON CONFLICT(category, LOWER(item)) DO UPDATE SET
+                (item, reason, keywords, base_score, source, added_at, last_seen)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+             ON CONFLICT(LOWER(item)) DO UPDATE SET
                 reason     = excluded.reason,
                 keywords   = excluded.keywords,
                 base_score = base_score * 0.4 + excluded.base_score * 0.6,
                 source     = excluded.source,
                 last_seen  = excluded.last_seen",
-            params![category, item, reason, kw, base_score, source, now],
+            params![item, reason, kw, base_score, source, now],
         )?;
         Ok(())
     }
@@ -248,52 +273,40 @@ impl Db {
 
     /// Reset the decay clock for one entry without changing its score or reason.
     /// Returns true if the entry was found and updated, false if not found.
-    pub fn touch(&self, category: &str, item: &str) -> Result<bool> {
+    pub fn touch(&self, item: &str) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let n = self.conn.execute(
-            "UPDATE preferences SET last_seen = ?1
-             WHERE category = ?2 AND LOWER(item) = LOWER(?3)",
-            params![now, category, item],
+            "UPDATE preferences SET last_seen = ?1 WHERE LOWER(item) = LOWER(?2)",
+            params![now, item],
         )?;
         Ok(n > 0)
     }
 
-    pub fn remove(&self, category: &str, item: &str) -> Result<bool> {
+    pub fn remove(&self, item: &str) -> Result<bool> {
         let n = self.conn.execute(
-            "DELETE FROM preferences WHERE category = ?1 AND LOWER(item) = LOWER(?2)",
-            params![category, item],
+            "DELETE FROM preferences WHERE LOWER(item) = LOWER(?1)",
+            params![item],
         )?;
         Ok(n > 0)
     }
 
     /// Replace the keywords on an existing entry. Returns true if the entry was found.
-    pub fn tag(&self, category: &str, item: &str, keywords: &[String]) -> Result<bool> {
+    pub fn tag(&self, item: &str, keywords: &[String]) -> Result<bool> {
         let kw = keywords.iter().map(|k| k.to_lowercase()).collect::<Vec<_>>().join(", ");
         let n = self.conn.execute(
-            "UPDATE preferences SET keywords = ?1
-             WHERE category = ?2 AND LOWER(item) = LOWER(?3)",
-            params![kw, category, item],
+            "UPDATE preferences SET keywords = ?1 WHERE LOWER(item) = LOWER(?2)",
+            params![kw, item],
         )?;
         Ok(n > 0)
     }
 
-    /// Return all keywords with their entry counts, optionally filtered by category.
-    pub fn all_keywords(&self, category: Option<&str>) -> Result<Vec<(String, usize)>> {
-        let rows: Vec<String> = if let Some(cat) = category {
-            let mut stmt = self.conn.prepare(
-                "SELECT keywords FROM preferences WHERE category = ?1 AND keywords != ''",
-            )?;
-            let x = stmt.query_map(params![cat], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            x
-        } else {
-            let mut stmt = self.conn.prepare(
-                "SELECT keywords FROM preferences WHERE keywords != ''",
-            )?;
-            let x = stmt.query_map([], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            x
-        };
+    /// Return all keywords with their entry counts.
+    pub fn all_keywords(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT keywords FROM preferences WHERE keywords != ''",
+        )?;
+        let rows: Vec<String> = stmt.query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
 
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for row in rows {
@@ -332,7 +345,7 @@ impl Db {
     // ── Reads ─────────────────────────────────────────────────────────────────
 
     const SELECT: &'static str =
-        "SELECT id, category, item, reason, keywords, base_score, source, added_at, last_seen
+        "SELECT id, item, reason, keywords, base_score, source, added_at, last_seen
          FROM preferences";
 
     fn sorted(mut rows: Vec<Preference>) -> Vec<Preference> {
@@ -340,51 +353,32 @@ impl Db {
         rows
     }
 
-    pub fn all(&self, category: Option<&str>) -> Result<Vec<Preference>> {
+    pub fn all(&self) -> Result<Vec<Preference>> {
         let cfg = self.get_decay_config()?;
-        let rows: Vec<Preference> = if let Some(cat) = category {
-            let sql = format!("{} WHERE category = ?1", Self::SELECT);
-            let mut stmt = self.conn.prepare(&sql)?;
-            let x = stmt
-                .query_map(params![cat], |row| Self::hydrate(row, &cfg))?
-                .collect::<rusqlite::Result<_>>()?;
-            x
-        } else {
-            let mut stmt = self.conn.prepare(Self::SELECT)?;
-            let x = stmt
-                .query_map([], |row| Self::hydrate(row, &cfg))?
-                .collect::<rusqlite::Result<_>>()?;
-            x
-        };
+        let mut stmt = self.conn.prepare(Self::SELECT)?;
+        let rows: Vec<Preference> = stmt
+            .query_map([], |row| Self::hydrate(row, &cfg))?
+            .collect::<rusqlite::Result<_>>()?;
         Ok(Self::sorted(rows))
     }
 
-    pub fn top(&self, n: usize, category: Option<&str>) -> Result<Vec<Preference>> {
-        let mut rows = self.all(category)?;
+    pub fn top(&self, n: usize) -> Result<Vec<Preference>> {
+        let mut rows = self.all()?;
         rows.truncate(n);
         Ok(rows)
     }
 
-    pub fn recall(&self, query: &str, category: Option<&str>, touch: bool) -> Result<Vec<Preference>> {
+    pub fn recall(&self, query: &str, touch: bool) -> Result<Vec<Preference>> {
         let cfg = self.get_decay_config()?;
         let pattern = format!("%{}%", query.to_lowercase());
-        let filter =
-            "LOWER(item) LIKE ?1 OR LOWER(reason) LIKE ?1 OR LOWER(keywords) LIKE ?1";
-        let rows: Vec<Preference> = if let Some(cat) = category {
-            let sql = format!("{} WHERE ({}) AND category = ?2", Self::SELECT, filter);
-            let mut stmt = self.conn.prepare(&sql)?;
-            let x = stmt
-                .query_map(params![pattern, cat], |row| Self::hydrate(row, &cfg))?
-                .collect::<rusqlite::Result<_>>()?;
-            x
-        } else {
-            let sql = format!("{} WHERE {}", Self::SELECT, filter);
-            let mut stmt = self.conn.prepare(&sql)?;
-            let x = stmt
-                .query_map(params![pattern], |row| Self::hydrate(row, &cfg))?
-                .collect::<rusqlite::Result<_>>()?;
-            x
-        };
+        let sql = format!(
+            "{} WHERE LOWER(item) LIKE ?1 OR LOWER(reason) LIKE ?1 OR LOWER(keywords) LIKE ?1",
+            Self::SELECT
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows: Vec<Preference> = stmt
+            .query_map(params![pattern], |row| Self::hydrate(row, &cfg))?
+            .collect::<rusqlite::Result<_>>()?;
         let rows = Self::sorted(rows);
         if touch {
             self.touch_ids(rows.iter().map(|p| p.id).collect())?;
@@ -397,28 +391,24 @@ impl Db {
             self.conn.query_row(sql, [], |r| r.get(0))
         };
         Ok(Stats {
-            preferences: count("SELECT COUNT(*) FROM preferences WHERE category='preference'")?,
-            aversions:   count("SELECT COUNT(*) FROM preferences WHERE category='aversion'")?,
-            habits:      count("SELECT COUNT(*) FROM preferences WHERE category='habit'")?,
-            styles:      count("SELECT COUNT(*) FROM preferences WHERE category='style'")?,
-            taboos:      count("SELECT COUNT(*) FROM preferences WHERE category='taboo'")?,
-            sessions:    count("SELECT COUNT(*) FROM sessions")?,
+            high:     count("SELECT COUNT(*) FROM preferences WHERE base_score >= 7.0")?,
+            mid:      count("SELECT COUNT(*) FROM preferences WHERE base_score > 3.0 AND base_score < 7.0")?,
+            low:      count("SELECT COUNT(*) FROM preferences WHERE base_score <= 3.0")?,
+            sessions: count("SELECT COUNT(*) FROM sessions")?,
         })
     }
 }
 
 #[derive(Debug)]
 pub struct Stats {
-    pub preferences: usize,
-    pub aversions:   usize,
-    pub habits:      usize,
-    pub styles:      usize,
-    pub taboos:      usize,
-    pub sessions:    usize,
+    pub high: usize,      // score ≥ 7: strong likes
+    pub mid: usize,       // score 4–6: neutral habits
+    pub low: usize,       // score ≤ 3: dislikes / limits
+    pub sessions: usize,
 }
 
 impl Stats {
     pub fn total(&self) -> usize {
-        self.preferences + self.aversions + self.habits + self.styles + self.taboos
+        self.high + self.mid + self.low
     }
 }

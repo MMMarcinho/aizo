@@ -210,13 +210,13 @@ And these recent interactions:
 <paste session logs>
 
 Which preferences were clearly demonstrated or confirmed today?
-Return ONLY a JSON array of objects: [{"category": "...", "item": "..."}]
+Return ONLY a JSON array of item strings: ["item one", "item two", ...]
 Only include items that were unambiguously present. Return [] if none.
 ```
 
 4. For each confirmed item returned by the LLM, call:
 ```bash
-aizo touch <category> "<item>"
+aizo touch "<item>"
 ```
 
 5. That's it — no new entries created, no scores changed. Only the decay clock resets.

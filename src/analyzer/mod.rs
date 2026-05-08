@@ -7,19 +7,12 @@ const OPENAI_DEFAULT_URL: &str = "https://api.openai.com/v1/chat/completions";
 
 const PROMPT_BASE: &str = r#"You are a user preference extraction engine. Analyze the conversation and identify the user's explicit and implicit preferences, aversions, habits, communication styles, and hard limits.
 
-Category definitions:
-- "preference"  — things the user consistently likes, prioritizes, or favors (base_score 7–10)
-- "aversion"    — things the user dislikes, avoids, or rejects (base_score 0–3)
-- "habit"       — behavioral or workflow patterns, value-neutral (base_score 4–6)
-- "style"       — communication, tone, or formatting preferences (base_score 5–10)
-- "taboo"       — hard limits, absolute rejections, must-never-do (base_score 0–2)
-
 base_score scale:
-  0    = absolute taboo / strong rejection
-  1–3  = clear dislike
+  0    = absolute hard limit / must never do
+  1–3  = clear dislike / aversion
   4–6  = neutral tendency / weak pattern
-  7–9  = clear preference
-  10   = strong, consistent, high-priority preference
+  7–9  = clear preference / like
+  10   = strong, consistent, high-priority love
 
 Rules:
 - Only include entries where base_score ≤ 3 OR base_score ≥ 7 — discard weak signals near neutral.
@@ -31,7 +24,6 @@ const SCHEMA_NO_KW: &str = r#"Return ONLY a JSON object with this exact shape:
 {
   "entries": [
     {
-      "category": "<category>",
       "item": "<short label>",
       "reason": "<one sentence>",
       "base_score": <0.0-10.0>
@@ -43,7 +35,6 @@ const SCHEMA_WITH_KW: &str = r#"Return ONLY a JSON object with this exact shape:
 {
   "entries": [
     {
-      "category": "<category>",
       "item": "<short label>",
       "reason": "<one sentence>",
       "keywords": ["<synonym1>", "<synonym2>", ...],
@@ -74,7 +65,6 @@ fn max_tokens() -> u32 {
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ExtractedEntry {
-    pub category: String,
     pub item: String,
     pub reason: String,
     #[serde(default)]
@@ -137,12 +127,7 @@ pub fn parse_result(text: &str) -> Result<ExtractionResult> {
     let mut result: ExtractionResult = serde_json::from_str(json_str)
         .with_context(|| format!("LLM returned non-JSON: {}", &json_str[..json_str.len().min(300)]))?;
 
-    const VALID_CATS: &[&str] = &["preference", "aversion", "habit", "style", "taboo"];
-    result.entries.retain(|e| {
-        VALID_CATS.contains(&e.category.as_str())
-            && e.base_score >= 0.0
-            && e.base_score <= 10.0
-    });
+    result.entries.retain(|e| e.base_score >= 0.0 && e.base_score <= 10.0);
     for e in &mut result.entries {
         e.keywords = e.keywords.iter().map(|k| k.to_lowercase()).collect();
     }

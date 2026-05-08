@@ -31,7 +31,7 @@ enum Command {
     /// Requires LLM configuration via env vars (AIZO_MODEL, AIZO_API_KEY, etc.).
     /// For LLM-agnostic analysis use: aizo extract [file] | <llm> | aizo import
     Analyze {
-        /// Path to session text file; reads stdin if omitted
+        /// Path to session text/JSON file; reads stdin if omitted
         file: Option<PathBuf>,
     },
 
@@ -39,7 +39,7 @@ enum Command {
     ///
     /// Example: aizo extract chat.txt | ollama run qwen2.5:3b | aizo import
     Extract {
-        /// Path to session text file; reads stdin if omitted
+        /// Path to session text/JSON file; reads stdin if omitted
         file: Option<PathBuf>,
     },
 
@@ -52,9 +52,6 @@ enum Command {
     Recall {
         /// Keyword matched against item, reason, AND synonyms (case-insensitive)
         query: String,
-        /// Filter by category: preference, aversion, habit, style, taboo (or aliases: love, hate)
-        #[arg(long = "type", short = 't')]
-        kind: Option<String>,
         /// Do not refresh last_seen for matched entries
         #[arg(long)]
         no_touch: bool,
@@ -68,9 +65,6 @@ enum Command {
         /// Number of entries to show (default: 10)
         #[arg(default_value = "10")]
         n: usize,
-        /// Filter by category: preference, aversion, habit, style, taboo (or aliases: love, hate)
-        #[arg(long = "type", short = 't')]
-        kind: Option<String>,
         /// Output raw JSON instead of human-readable text
         #[arg(long)]
         json: bool,
@@ -78,9 +72,6 @@ enum Command {
 
     /// Print the full preference profile sorted by effective weight
     Show {
-        /// Filter by category: preference, aversion, habit, style, taboo (or aliases: love, hate)
-        #[arg(long = "type", short = 't')]
-        kind: Option<String>,
         /// Output raw JSON instead of human-readable text
         #[arg(long)]
         json: bool,
@@ -96,12 +87,9 @@ enum Command {
         /// One-sentence reason (remaining words joined)
         #[arg(trailing_var_arg = true, num_args = 1..)]
         reason: Vec<String>,
-        /// Base score 0.0–10.0; category is inferred when --type is omitted
+        /// Base score 0.0–10.0 (defaults to 9.0)
         #[arg(long, short = 's')]
         score: Option<f64>,
-        /// Explicit category: preference|love, aversion|hate, habit, style, taboo
-        #[arg(long = "type", short = 't')]
-        kind: Option<String>,
         /// Comma-separated synonym keywords for richer recall (e.g. concise,brevity,minimal)
         #[arg(long, value_delimiter = ',')]
         keywords: Vec<String>,
@@ -109,8 +97,6 @@ enum Command {
 
     /// Add or replace keywords on an existing entry without changing its score or reason
     Tag {
-        /// Category: preference|love, aversion|hate, habit, style, taboo
-        category: String,
         /// Item label (case-insensitive)
         item: String,
         /// Keywords to set (space or comma-separated)
@@ -123,18 +109,14 @@ enum Command {
     /// Call this when the agent confirms a preference was just demonstrated,
     /// without needing to re-analyze the full session through the LLM.
     Touch {
-        /// Category: preference|love, aversion|hate, habit, style, taboo
-        category: String,
-        /// Item label to refresh (case-insensitive, remaining words joined)
+        /// Item label to refresh (case-insensitive, words joined)
         #[arg(trailing_var_arg = true, num_args = 1..)]
         item: Vec<String>,
     },
 
-    /// Remove a preference by category and item label
+    /// Remove a preference by item label
     Remove {
-        /// Category: preference|love, aversion|hate, habit, style, taboo
-        category: String,
-        /// Item label to remove (case-insensitive, remaining words joined)
+        /// Item label to remove (case-insensitive, words joined)
         #[arg(trailing_var_arg = true, num_args = 1..)]
         item: Vec<String>,
     },
@@ -144,9 +126,6 @@ enum Command {
         /// Sort order: count (default) or alpha
         #[arg(long, default_value = "count")]
         sort: String,
-        /// Filter by category: preference, aversion, habit, style, taboo (or aliases: love, hate)
-        #[arg(long = "type", short = 't')]
-        kind: Option<String>,
     },
 
     /// Interactive first-time setup: configure LLM provider and write ~/.aizo/.env
@@ -180,32 +159,6 @@ fn default_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".aizo")
         .join("preferences.db")
-}
-
-/// Map user-facing category names (including aliases) to canonical name + default base_score.
-fn resolve_category(s: &str) -> Result<(&'static str, f64)> {
-    match s {
-        "preference" | "love" => Ok(("preference", 9.0)),
-        "aversion" | "hate" => Ok(("aversion", 1.0)),
-        "habit" => Ok(("habit", 5.0)),
-        "style" => Ok(("style", 8.0)),
-        "taboo" => Ok(("taboo", 0.5)),
-        _ => anyhow::bail!(
-            "unknown category '{s}'. Use: preference (love), aversion (hate), habit, style, taboo"
-        ),
-    }
-}
-
-fn canonical_category(s: &str) -> Result<&'static str> {
-    Ok(resolve_category(s)?.0)
-}
-
-/// Infer category from score when the user doesn't specify one.
-fn infer_category(score: f64) -> &'static str {
-    if score <= 1.5 { "taboo" }
-    else if score <= 4.0 { "aversion" }
-    else if score <= 6.5 { "habit" }
-    else { "preference" }
 }
 
 /// FNV-1a 64-bit hash — stable, dependency-free, good enough for dedup.
@@ -257,7 +210,6 @@ fn json_to_session_text(raw: &str) -> Option<String> {
                 _ => None,
             };
         }
-        // fallback field names used in some exports
         msg.get("text")
             .or_else(|| msg.get("message"))
             .and_then(|v| v.as_str())
@@ -356,7 +308,7 @@ fn read_text(file: Option<PathBuf>) -> Result<String> {
 }
 
 fn profile_context(db: &Db) -> Result<Option<String>> {
-    let prefs = db.top(20, None)?;
+    let prefs = db.top(20)?;
     Ok(if prefs.is_empty() {
         None
     } else {
@@ -367,9 +319,13 @@ fn profile_context(db: &Db) -> Result<Option<String>> {
 fn format_profile_context(prefs: &[Preference]) -> String {
     prefs
         .iter()
-        .map(|p| format!("[{}] {} ({:.1}): {}", p.category, p.item, p.base_score, p.reason))
+        .map(|p| format!("{} ({:.1}): {}", p.item, p.base_score, p.reason))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn score_label(score: f64) -> &'static str {
+    if score >= 7.0 { "liked" } else if score <= 3.0 { "disliked" } else { "neutral" }
 }
 
 fn print_entries(entries: &[Preference], json: bool) {
@@ -378,60 +334,49 @@ fn print_entries(entries: &[Preference], json: bool) {
         return;
     }
 
-    // Summary line
-    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for e in entries {
-        *counts.entry(e.category.as_str()).or_insert(0) += 1;
-    }
-    let summary = ["preference", "aversion", "habit", "style", "taboo"]
-        .iter()
-        .filter_map(|cat| counts.get(cat).map(|n| format!("{n} {cat}(s)")))
-        .collect::<Vec<_>>()
-        .join("  ·  ");
-    println!("{summary}");
+    let high = entries.iter().filter(|e| e.base_score >= 7.0).count();
+    let low  = entries.iter().filter(|e| e.base_score <= 3.0).count();
+    let mid  = entries.len() - high - low;
+
+    let mut parts = Vec::new();
+    if high > 0 { parts.push(format!("{high} liked")); }
+    if mid  > 0 { parts.push(format!("{mid} neutral")); }
+    if low  > 0 { parts.push(format!("{low} disliked")); }
+    println!("{} entries  ({})", entries.len(), parts.join(" · "));
     println!();
 
     for e in entries {
-        println!(
-            "  [{:<10}]  {:<26}  {:>4.1}   {}",
-            e.category, e.item, e.effective_weight, e.reason
-        );
+        println!("  {:<28}  {:>4.1}   {}", e.item, e.effective_weight, e.reason);
     }
 }
 
 fn print_analyze_summary(entries: &[analyzer::ExtractedEntry]) {
-    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for e in entries {
-        *counts.entry(e.category.as_str()).or_insert(0) += 1;
-    }
-    let mut parts: Vec<String> = counts.iter().map(|(k, v)| format!("{v} {k}(s)")).collect();
-    parts.sort();
-    println!("✓  Extracted {} entries: {}", entries.len(), parts.join(", "));
+    let high: Vec<_> = {
+        let mut v: Vec<_> = entries.iter().filter(|e| e.base_score >= 7.0).collect();
+        v.sort_by(|a, b| b.base_score.partial_cmp(&a.base_score).unwrap());
+        v
+    };
+    let low: Vec<_> = {
+        let mut v: Vec<_> = entries.iter().filter(|e| e.base_score <= 3.0).collect();
+        v.sort_by(|a, b| a.base_score.partial_cmp(&b.base_score).unwrap());
+        v
+    };
 
-    let mut highs: Vec<_> = entries.iter().filter(|e| e.base_score >= 7.0).collect();
-    let mut lows: Vec<_> = entries.iter().filter(|e| e.base_score <= 3.0).collect();
-    highs.sort_by(|a, b| b.base_score.partial_cmp(&a.base_score).unwrap());
-    lows.sort_by(|a, b| a.base_score.partial_cmp(&b.base_score).unwrap());
+    println!("✓  Extracted {} entries: {} liked, {} disliked", entries.len(), high.len(), low.len());
 
-    if !highs.is_empty() {
-        println!("\nPreferences / loves:");
-        for e in &highs {
-            println!(
-                "  + [{:4.1}] [{}] {}  —  {}",
-                e.base_score, e.category, e.item, e.reason
-            );
+    if !high.is_empty() {
+        println!("\nLiked:");
+        for e in &high {
+            println!("  + [{:4.1}] {}  —  {}", e.base_score, e.item, e.reason);
             if !e.keywords.is_empty() {
                 println!("           keywords: {}", e.keywords.join(", "));
             }
         }
     }
-    if !lows.is_empty() {
-        println!("\nAversions / hates:");
-        for e in &lows {
-            println!(
-                "  - [{:4.1}] [{}] {}  —  {}",
-                e.base_score, e.category, e.item, e.reason
-            );
+    if !low.is_empty() {
+        println!("\nDisliked / limits:");
+        for e in &low {
+            println!("  - [{:4.1}] {}  —  {}", e.base_score, e.item, e.reason);
             if !e.keywords.is_empty() {
                 println!("           keywords: {}", e.keywords.join(", "));
             }
@@ -582,9 +527,8 @@ fn main() -> Result<()> {
     let db = Db::open(&db_path)?;
 
     match cli.command {
-        Command::Keywords { sort, kind } => {
-            let cat = kind.as_deref().map(canonical_category).transpose()?;
-            let mut kws = db.all_keywords(cat)?;
+        Command::Keywords { sort } => {
+            let mut kws = db.all_keywords()?;
 
             if sort == "alpha" {
                 kws.sort_by(|a, b| a.0.cmp(&b.0));
@@ -600,15 +544,12 @@ fn main() -> Result<()> {
                     Some(terms) => {
                         let term_set: std::collections::HashSet<&str> =
                             terms.iter().map(String::as_str).collect();
-                        let active: std::collections::HashSet<&str> =
-                            kws.iter().map(|(k, _)| k.as_str()).collect();
                         let active_count = kws.iter().filter(|(k, _)| term_set.contains(k.as_str())).count();
                         println!("Taxonomy coverage: {active_count} / {} terms active\n", terms.len());
 
                         println!("  {:<28}  entries", "keyword");
                         println!("  {}", "─".repeat(40));
 
-                        // taxonomy terms first (active then unused)
                         for term in terms {
                             if let Some((_, n)) = kws.iter().find(|(k, _)| k == term) {
                                 println!("  {:<28}  {n}", term);
@@ -616,7 +557,6 @@ fn main() -> Result<()> {
                                 println!("  {:<28}  —", term);
                             }
                         }
-                        // free-form keywords not in taxonomy
                         let extras: Vec<_> = kws.iter().filter(|(k, _)| !term_set.contains(k.as_str())).collect();
                         if !extras.is_empty() {
                             println!("\n  [not in taxonomy]");
@@ -624,7 +564,6 @@ fn main() -> Result<()> {
                                 println!("  {:<28}  {n}", kw);
                             }
                         }
-                        let _ = active;
                     }
                     None => {
                         println!("  {:<28}  entries", "keyword");
@@ -657,7 +596,7 @@ fn main() -> Result<()> {
             let result = analyzer::analyze(&text, existing_profile.as_deref(), taxonomy.as_deref())?;
 
             for e in &result.entries {
-                db.upsert(&e.category, &e.item, &e.reason, &e.keywords, e.base_score, "analysis")?;
+                db.upsert(&e.item, &e.reason, &e.keywords, e.base_score, "analysis")?;
             }
             db.log_session(result.entries.len(), &hash)?;
             print_analyze_summary(&result.entries);
@@ -675,26 +614,23 @@ fn main() -> Result<()> {
             std::io::stdin().read_to_string(&mut buf)?;
             let result = analyzer::parse_result(&buf)?;
             for e in &result.entries {
-                db.upsert(&e.category, &e.item, &e.reason, &e.keywords, e.base_score, "analysis")?;
+                db.upsert(&e.item, &e.reason, &e.keywords, e.base_score, "analysis")?;
             }
             db.log_session(result.entries.len(), "")?;
             print_analyze_summary(&result.entries);
         }
 
-        Command::Recall { query, kind, no_touch, json } => {
-            let cat = kind.as_deref().map(canonical_category).transpose()?;
-            let prefs = db.recall(&query, cat, !no_touch)?;
+        Command::Recall { query, no_touch, json } => {
+            let prefs = db.recall(&query, !no_touch)?;
             if prefs.is_empty() {
-                let scope = cat.map(|c| format!(" in [{c}]")).unwrap_or_default();
-                println!("No preferences matched \"{query}\"{scope}.");
+                println!("No preferences matched \"{query}\".");
             } else {
                 print_entries(&prefs, json);
             }
         }
 
-        Command::Top { n, kind, json } => {
-            let cat = kind.as_deref().map(canonical_category).transpose()?;
-            let prefs = db.top(n, cat)?;
+        Command::Top { n, json } => {
+            let prefs = db.top(n)?;
             if prefs.is_empty() {
                 println!("No preferences recorded yet.");
             } else {
@@ -702,9 +638,8 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Show { kind, json } => {
-            let cat = kind.as_deref().map(canonical_category).transpose()?;
-            let prefs = db.all(cat)?;
+        Command::Show { json } => {
+            let prefs = db.all()?;
             if prefs.is_empty() {
                 println!("No preferences recorded yet.");
             } else {
@@ -712,74 +647,67 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Add { item, reason, score, kind, keywords } => {
+        Command::Add { item, reason, score, keywords } => {
             if reason.is_empty() {
-                anyhow::bail!("usage: aizo add <item> <reason…> [--score 0-10] [--type category] [--keywords k1,k2,…]");
+                anyhow::bail!("usage: aizo add <item> <reason…> [--score 0-10] [--keywords k1,k2,…]");
             }
             let base_score = match score {
                 Some(s) if (0.0..=10.0).contains(&s) => s,
                 Some(s) => anyhow::bail!("--score must be between 0.0 and 10.0, got {s}"),
-                None => kind.as_deref().map(|k| resolve_category(k).map(|(_, s)| s)).transpose()?.unwrap_or(9.0),
-            };
-            let cat = match kind.as_deref() {
-                Some(k) => resolve_category(k)?.0,
-                None => infer_category(base_score),
+                None => 9.0,
             };
             let reason_str = reason.join(" ");
             let kws: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
-            db.upsert(cat, &item, &reason_str, &kws, base_score, "manual")?;
+            db.upsert(&item, &reason_str, &kws, base_score, "manual")?;
+            let label = score_label(base_score);
             if kws.is_empty() {
-                println!("Added [{cat}]: \"{item}\" (base_score {base_score:.1})");
+                println!("Added [{label}]: \"{item}\" (score {base_score:.1})");
             } else {
-                println!("Added [{cat}]: \"{item}\" (base_score {base_score:.1})  keywords: {}", kws.join(", "));
+                println!("Added [{label}]: \"{item}\" (score {base_score:.1})  keywords: {}", kws.join(", "));
             }
         }
 
-        Command::Tag { category, item, keywords } => {
-            let (cat, _) = resolve_category(&category)?;
+        Command::Tag { item, keywords } => {
             if keywords.is_empty() {
-                anyhow::bail!("usage: aizo tag <category> <item> <keyword>…");
+                anyhow::bail!("usage: aizo tag <item> <keyword>…");
             }
-            // support both space-separated and comma-separated input
             let kws: Vec<String> = keywords
                 .iter()
                 .flat_map(|k| k.split(','))
                 .map(|k| k.trim().to_lowercase())
                 .filter(|k| !k.is_empty())
                 .collect();
-            let found = db.tag(cat, &item, &kws)?;
+            let found = db.tag(&item, &kws)?;
             if found {
-                println!("Tagged [{cat}]: \"{item}\"  keywords: {}", kws.join(", "));
+                println!("Tagged \"{item}\"  keywords: {}", kws.join(", "));
             } else {
-                println!("Not found: [{cat}] \"{item}\"");
+                println!("Not found: \"{item}\"");
             }
         }
 
-        Command::Touch { category, item } => {
-            let (cat, _) = resolve_category(&category)?;
+        Command::Touch { item } => {
             let item_str = item.join(" ");
             if item_str.is_empty() {
-                anyhow::bail!("usage: aizo touch <category> <item…>");
+                anyhow::bail!("usage: aizo touch <item…>");
             }
-            let found = db.touch(cat, &item_str)?;
+            let found = db.touch(&item_str)?;
             if found {
-                println!("Touched [{cat}]: \"{item_str}\" — decay clock reset.");
+                println!("Touched \"{item_str}\" — decay clock reset.");
             } else {
-                println!("Not found: [{cat}] \"{item_str}\"");
+                println!("Not found: \"{item_str}\"");
             }
         }
 
-        Command::Remove { category, item } => {
-            let (cat, _) = resolve_category(&category)?;
+        Command::Remove { item } => {
             let item_str = item.join(" ");
             if item_str.is_empty() {
-                anyhow::bail!("usage: aizo remove <category> <item…>");
+                anyhow::bail!("usage: aizo remove <item…>");
             }
-            let removed = db.remove(cat, &item_str)?;
+            let removed = db.remove(&item_str)?;
             if removed {
-                println!("Removed [{cat}]: \"{item_str}\"");
+                println!("Removed \"{item_str}\"");
             } else {
-                println!("Not found: [{cat}] \"{item_str}\"");
+                println!("Not found: \"{item_str}\"");
             }
         }
 
@@ -795,17 +723,15 @@ fn main() -> Result<()> {
             println!("Config");
             println!("  ~/.aizo/.env : {}", if user_env    { "loaded" } else { "not found" });
             println!("  ./.env       : {}", if project_env { "loaded" } else { "not found" });
-            println!("  AIZO_MODEL      : {}", std::env::var("AIZO_MODEL").unwrap_or_else(|_| "(not set)".into()));
-            println!("  AIZO_API_URL    : {}", std::env::var("AIZO_API_URL").unwrap_or_else(|_| "(not set)".into()));
-            println!("  AIZO_API_FORMAT : {}", std::env::var("AIZO_API_FORMAT").unwrap_or_else(|_| "(not set)".into()));
-            println!("  AIZO_AUTO_KEYWORDS   : {}", std::env::var("AIZO_AUTO_KEYWORDS").unwrap_or_else(|_| "false (default)".into()));
-            println!("  AIZO_MAX_TOKENS      : {}", std::env::var("AIZO_MAX_TOKENS").unwrap_or_else(|_| "8192 (default)".into()));
+            println!("  AIZO_MODEL         : {}", std::env::var("AIZO_MODEL").unwrap_or_else(|_| "(not set)".into()));
+            println!("  AIZO_API_URL       : {}", std::env::var("AIZO_API_URL").unwrap_or_else(|_| "(not set)".into()));
+            println!("  AIZO_API_FORMAT    : {}", std::env::var("AIZO_API_FORMAT").unwrap_or_else(|_| "(not set)".into()));
+            println!("  AIZO_AUTO_KEYWORDS : {}", std::env::var("AIZO_AUTO_KEYWORDS").unwrap_or_else(|_| "false (default)".into()));
+            println!("  AIZO_MAX_TOKENS    : {}", std::env::var("AIZO_MAX_TOKENS").unwrap_or_else(|_| "8192 (default)".into()));
             println!("Total       : {}", stats.total());
-            println!("  preference: {}", stats.preferences);
-            println!("  aversion  : {}", stats.aversions);
-            println!("  habit     : {}", stats.habits);
-            println!("  style     : {}", stats.styles);
-            println!("  taboo     : {}", stats.taboos);
+            println!("  liked     : {} (score ≥ 7)", stats.high);
+            println!("  neutral   : {} (score 4–6)", stats.mid);
+            println!("  disliked  : {} (score ≤ 3)", stats.low);
             println!("Sessions    : {}", stats.sessions);
             println!("Decay");
             println!("  half-life : {} days", cfg.half_life_days);
