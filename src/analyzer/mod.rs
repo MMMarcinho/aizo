@@ -5,20 +5,7 @@ const ANTHROPIC_DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 const ANTHROPIC_DEFAULT_URL: &str = "https://api.anthropic.com/v1/messages";
 const OPENAI_DEFAULT_URL: &str = "https://api.openai.com/v1/chat/completions";
 
-const SYSTEM_PROMPT: &str = r#"You are a user preference extraction engine. Analyze the conversation and identify the user's explicit and implicit preferences, aversions, habits, communication styles, and hard limits.
-
-Return ONLY a JSON object with this exact shape:
-{
-  "entries": [
-    {
-      "category": "<category>",
-      "item": "<short label>",
-      "reason": "<one sentence>",
-      "keywords": ["<synonym1>", "<synonym2>", ...],
-      "base_score": <0.0-10.0>
-    }
-  ]
-}
+const PROMPT_BASE: &str = r#"You are a user preference extraction engine. Analyze the conversation and identify the user's explicit and implicit preferences, aversions, habits, communication styles, and hard limits.
 
 Category definitions:
 - "preference"  — things the user consistently likes, prioritizes, or favors (base_score 7–10)
@@ -34,16 +21,45 @@ base_score scale:
   7–9  = clear preference
   10   = strong, consistent, high-priority preference
 
-keywords rules:
-- 3–6 synonyms, related terms, or paraphrases that a user might search for to find this entry
-- lowercase only
-- example for "over-engineered code": ["complexity", "bloat", "abstraction", "yagni", "indirection"]
-
 Rules:
 - Only include entries where base_score ≤ 3 OR base_score ≥ 7 — discard weak signals near neutral.
 - "item" must be a concise reusable label (≤5 words).
 - Return {"entries": []} if no strong signals detected.
 - Raw JSON only — no markdown fences, no explanation."#;
+
+const SCHEMA_NO_KW: &str = r#"Return ONLY a JSON object with this exact shape:
+{
+  "entries": [
+    {
+      "category": "<category>",
+      "item": "<short label>",
+      "reason": "<one sentence>",
+      "base_score": <0.0-10.0>
+    }
+  ]
+}"#;
+
+const SCHEMA_WITH_KW: &str = r#"Return ONLY a JSON object with this exact shape:
+{
+  "entries": [
+    {
+      "category": "<category>",
+      "item": "<short label>",
+      "reason": "<one sentence>",
+      "keywords": ["<synonym1>", "<synonym2>", ...],
+      "base_score": <0.0-10.0>
+    }
+  ]
+}
+
+keywords rules:
+- 3–6 synonyms, related terms, or paraphrases that a user might search for to find this entry
+- lowercase only
+- example for "over-engineered code": ["complexity", "bloat", "abstraction", "yagni", "indirection"]"#;
+
+fn keywords_enabled() -> bool {
+    std::env::var("AIZO_KEYWORDS").as_deref() == Ok("true")
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ExtractedEntry {
@@ -63,13 +79,17 @@ pub struct ExtractionResult {
 // ── Prompt construction ───────────────────────────────────────────────────────
 
 fn build_system(existing_profile: Option<&str>, taxonomy: Option<&[String]>) -> String {
-    let mut out = SYSTEM_PROMPT.to_string();
-    if let Some(terms) = taxonomy {
-        if !terms.is_empty() {
-            out.push_str(
-                "\n\nKeyword taxonomy — select keywords ONLY from this list (do not invent new ones):\n",
-            );
-            out.push_str(&terms.join(", "));
+    let schema = if keywords_enabled() { SCHEMA_WITH_KW } else { SCHEMA_NO_KW };
+    let mut out = format!("{schema}\n\n{PROMPT_BASE}");
+
+    if keywords_enabled() {
+        if let Some(terms) = taxonomy {
+            if !terms.is_empty() {
+                out.push_str(
+                    "\n\nKeyword taxonomy — select keywords ONLY from this list (do not invent new ones):\n",
+                );
+                out.push_str(&terms.join(", "));
+            }
         }
     }
     if let Some(p) = existing_profile {

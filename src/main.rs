@@ -411,6 +411,15 @@ fn cmd_init(db_path: &PathBuf) -> Result<()> {
         }
     }
 
+    println!();
+    println!("Auto-generate keywords during analyze?");
+    println!("  The LLM will add synonyms to each entry for richer recall.");
+    println!("  Disable if you prefer to control keywords manually via 'aizo tag'.");
+    let kw = prompt_yn("Enable keywords? [y/N]:", false)?;
+    if kw {
+        lines.push("AIZO_KEYWORDS=true".into());
+    }
+
     std::fs::create_dir_all(&aizo_dir)?;
     std::fs::write(&env_path, lines.join("\n") + "\n")?;
     println!("\nWriting config to {} ... done", env_path.display());
@@ -656,9 +665,10 @@ fn main() -> Result<()> {
             println!("Config");
             println!("  ~/.aizo/.env : {}", if user_env    { "loaded" } else { "not found" });
             println!("  ./.env       : {}", if project_env { "loaded" } else { "not found" });
-            println!("  AIZO_MODEL   : {}", std::env::var("AIZO_MODEL").unwrap_or_else(|_| "(not set)".into()));
-            println!("  AIZO_API_URL : {}", std::env::var("AIZO_API_URL").unwrap_or_else(|_| "(not set)".into()));
+            println!("  AIZO_MODEL      : {}", std::env::var("AIZO_MODEL").unwrap_or_else(|_| "(not set)".into()));
+            println!("  AIZO_API_URL    : {}", std::env::var("AIZO_API_URL").unwrap_or_else(|_| "(not set)".into()));
             println!("  AIZO_API_FORMAT : {}", std::env::var("AIZO_API_FORMAT").unwrap_or_else(|_| "(not set)".into()));
+            println!("  AIZO_KEYWORDS   : {}", std::env::var("AIZO_KEYWORDS").unwrap_or_else(|_| "false (default)".into()));
             println!("Total       : {}", stats.total());
             println!("  preference: {}", stats.preferences);
             println!("  aversion  : {}", stats.aversions);
