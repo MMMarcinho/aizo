@@ -58,7 +58,7 @@ keywords rules:
 - example for "over-engineered code": ["complexity", "bloat", "abstraction", "yagni", "indirection"]"#;
 
 fn keywords_enabled() -> bool {
-    std::env::var("AIZO_KEYWORDS").as_deref() == Ok("true")
+    std::env::var("AIZO_AUTO_KEYWORDS").as_deref() == Ok("true")
 }
 
 #[derive(Debug, Deserialize, Serialize)]
