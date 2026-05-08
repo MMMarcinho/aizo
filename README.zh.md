@@ -33,7 +33,7 @@ SQLite（~/.aizo/preferences.db）
 
 **第一步 — 衰减系数** $d(t)$
 
-$$d(t) = \phi + (1 - \phi)\,e^{-\lambda t}, \qquad \lambda = \frac{\ln 2}{t_{1/2}}$$
+$$d(t) = \phi + (1 - \phi) \cdot e^{-\lambda t}, \quad \lambda = \frac{\ln 2}{t_{1/2}}$$
 
 $t$ 为距上次触发的天数，$t_{1/2}$ 为配置的半衰期，$\phi$ 为衰减下限。
 
@@ -45,11 +45,11 @@ $$\alpha = \frac{10 - s}{10}$$
 
 **第三步 — 有效权重** $w$
 
-$$w = s \cdot d(t)^{\,\alpha}$$
+$$w = s \cdot d(t)^{\alpha}$$
 
 展开为单一表达式：
 
-$$\boxed{w = s \cdot \left[\phi + (1-\phi)\,e^{-\lambda t}\right]^{\!\frac{10-s}{10}}}$$
+$$\boxed{w = s \cdot \left[\phi + (1-\phi) \cdot e^{-\lambda t}\right]^{\frac{10-s}{10}}}$$
 
 **直觉解释：你越爱的东西，越不容易被遗忘；无所谓的习惯，慢慢就淡了。**
 

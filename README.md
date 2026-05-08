@@ -35,7 +35,7 @@ All scoring logic lives in `src/scoring/mod.rs`. Every preference entry carries 
 
 **Step 1 — Decay coefficient** $d(t)$
 
-$$d(t) = \phi + (1 - \phi)\,e^{-\lambda t}, \qquad \lambda = \frac{\ln 2}{t_{1/2}}$$
+$$d(t) = \phi + (1 - \phi) \cdot e^{-\lambda t}, \quad \lambda = \frac{\ln 2}{t_{1/2}}$$
 
 where $t$ is days since `last_seen`, $t_{1/2}$ is the configured half-life, and $\phi$ is the floor.
 
@@ -47,11 +47,11 @@ Higher score → smaller $\alpha$ → decay has less effect. A score-10 preferen
 
 **Step 3 — Effective weight** $w$
 
-$$w = s \cdot d(t)^{\,\alpha}$$
+$$w = s \cdot d(t)^{\alpha}$$
 
 Expanding into a single expression:
 
-$$\boxed{w = s \cdot \left[\phi + (1-\phi)\,e^{-\lambda t}\right]^{\!\frac{10-s}{10}}}$$
+$$\boxed{w = s \cdot \left[\phi + (1-\phi) \cdot e^{-\lambda t}\right]^{\frac{10-s}{10}}}$$
 
 **Boundary behaviour**
 
