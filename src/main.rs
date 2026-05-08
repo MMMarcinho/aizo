@@ -776,7 +776,7 @@ fn main() -> Result<()> {
             println!("  AIZO_API_URL    : {}", std::env::var("AIZO_API_URL").unwrap_or_else(|_| "(not set)".into()));
             println!("  AIZO_API_FORMAT : {}", std::env::var("AIZO_API_FORMAT").unwrap_or_else(|_| "(not set)".into()));
             println!("  AIZO_AUTO_KEYWORDS   : {}", std::env::var("AIZO_AUTO_KEYWORDS").unwrap_or_else(|_| "false (default)".into()));
-            println!("  AIZO_MAX_TOKENS      : {}", std::env::var("AIZO_MAX_TOKENS").unwrap_or_else(|_| "2048 (default)".into()));
+            println!("  AIZO_MAX_TOKENS      : {}", std::env::var("AIZO_MAX_TOKENS").unwrap_or_else(|_| "8192 (default)".into()));
             println!("Total       : {}", stats.total());
             println!("  preference: {}", stats.preferences);
             println!("  aversion  : {}", stats.aversions);

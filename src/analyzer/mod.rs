@@ -61,11 +61,15 @@ fn keywords_enabled() -> bool {
     std::env::var("AIZO_AUTO_KEYWORDS").as_deref() == Ok("true")
 }
 
+/// Controls the *output* token budget for the LLM response (the extracted JSON).
+/// The session text sent as input is unlimited — bounded only by the model's context window.
+/// 8192 is safe for all major providers (Anthropic Haiku cap, GPT-4o, local models).
+/// Raise via AIZO_MAX_TOKENS for very long sessions that produce many entries.
 fn max_tokens() -> u32 {
     std::env::var("AIZO_MAX_TOKENS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(2048)
+        .unwrap_or(8192)
 }
 
 #[derive(Debug, Deserialize, Serialize)]
