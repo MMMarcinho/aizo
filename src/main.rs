@@ -87,14 +87,21 @@ enum Command {
     },
 
     /// Manually add or update a preference
+    ///
+    /// Category is inferred from --score when --type is omitted:
+    ///   0.0–1.5 → taboo, 1.6–4.0 → aversion, 4.1–6.5 → habit, 6.6–10.0 → preference
     Add {
-        /// Category: preference|love, aversion|hate, habit, style, taboo
-        category: String,
         /// Short item label (e.g. "dark mode", "verbose comments")
         item: String,
         /// One-sentence reason (remaining words joined)
         #[arg(trailing_var_arg = true, num_args = 1..)]
         reason: Vec<String>,
+        /// Base score 0.0–10.0; category is inferred when --type is omitted
+        #[arg(long, short = 's')]
+        score: Option<f64>,
+        /// Explicit category: preference|love, aversion|hate, habit, style, taboo
+        #[arg(long = "type", short = 't')]
+        kind: Option<String>,
         /// Comma-separated synonym keywords for richer recall (e.g. concise,brevity,minimal)
         #[arg(long, value_delimiter = ',')]
         keywords: Vec<String>,
@@ -193,6 +200,14 @@ fn canonical_category(s: &str) -> Result<&'static str> {
     Ok(resolve_category(s)?.0)
 }
 
+/// Infer category from score when the user doesn't specify one.
+fn infer_category(score: f64) -> &'static str {
+    if score <= 1.5 { "taboo" }
+    else if score <= 4.0 { "aversion" }
+    else if score <= 6.5 { "habit" }
+    else { "preference" }
+}
+
 /// FNV-1a 64-bit hash — stable, dependency-free, good enough for dedup.
 fn content_hash(s: &str) -> String {
     const OFFSET: u64 = 14695981039346656037;
@@ -218,19 +233,126 @@ fn load_taxonomy() -> Option<Vec<String>> {
     if terms.is_empty() { None } else { Some(terms) }
 }
 
+/// Flatten a JSON conversation export into plain "Speaker: text" lines.
+///
+/// Supports:
+///   - Array of message objects (OpenAI, generic)
+///   - Object with a "messages" or "conversation" key containing such an array
+///   - Claude claude.ai export: each message has `content` as an array of typed blocks
+///   - JSONL: one message object per line
+fn json_to_session_text(raw: &str) -> Option<String> {
+    fn extract_content(msg: &serde_json::Value) -> Option<String> {
+        if let Some(c) = msg.get("content") {
+            return match c {
+                serde_json::Value::String(s) => Some(s.clone()),
+                serde_json::Value::Array(blocks) => {
+                    let text = blocks
+                        .iter()
+                        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("text"))
+                        .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if text.is_empty() { None } else { Some(text) }
+                }
+                _ => None,
+            };
+        }
+        // fallback field names used in some exports
+        msg.get("text")
+            .or_else(|| msg.get("message"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    }
+
+    fn speaker(msg: &serde_json::Value) -> &str {
+        let role = msg
+            .get("role")
+            .or_else(|| msg.get("sender"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        match role {
+            "human" | "user" => "User",
+            "assistant" | "ai" | "claude" => "Assistant",
+            other => other,
+        }
+    }
+
+    fn msgs_to_lines(arr: &[serde_json::Value]) -> Vec<String> {
+        arr.iter()
+            .filter_map(|msg| {
+                let content = extract_content(msg)?;
+                let content = content.trim();
+                if content.is_empty() { return None; }
+                Some(format!("{}: {content}", speaker(msg)))
+            })
+            .collect()
+    }
+
+    // Try JSONL first (multiple JSON objects, one per line)
+    let jsonl_lines: Vec<serde_json::Value> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    if jsonl_lines.len() > 1 {
+        let lines = msgs_to_lines(&jsonl_lines);
+        if !lines.is_empty() {
+            return Some(lines.join("\n\n"));
+        }
+    }
+
+    let v: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let arr: &[serde_json::Value] = match &v {
+        serde_json::Value::Array(a) => a,
+        serde_json::Value::Object(obj) => {
+            if let Some(serde_json::Value::Array(a)) =
+                obj.get("messages").or_else(|| obj.get("conversation"))
+            {
+                a
+            } else {
+                return None;
+            }
+        }
+        _ => return None,
+    };
+
+    let lines = msgs_to_lines(arr);
+    if lines.is_empty() { None } else { Some(lines.join("\n\n")) }
+}
+
 fn read_text(file: Option<PathBuf>) -> Result<String> {
-    let text = match file {
-        Some(p) => std::fs::read_to_string(&p)?,
+    let (raw, hint_json) = match file {
+        Some(ref p) => {
+            let is_json = matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("json" | "jsonl")
+            );
+            (std::fs::read_to_string(p)?, is_json)
+        }
         None => {
             let mut buf = String::new();
             std::io::stdin().read_to_string(&mut buf)?;
-            buf
+            let trimmed = buf.trim_start();
+            let looks_json = trimmed.starts_with('{') || trimmed.starts_with('[');
+            (buf, looks_json)
         }
     };
-    if text.trim().is_empty() {
+
+    if raw.trim().is_empty() {
         anyhow::bail!("no session text provided");
     }
-    Ok(text)
+
+    if hint_json {
+        match json_to_session_text(&raw) {
+            Some(text) => return Ok(text),
+            None => eprintln!(
+                "Warning: JSON input could not be parsed as a conversation; \
+                 sending raw content to the LLM."
+            ),
+        }
+    }
+
+    Ok(raw)
 }
 
 fn profile_context(db: &Db) -> Result<Option<String>> {
@@ -590,18 +712,26 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Add { category, item, reason, keywords } => {
-            let (cat, default_score) = resolve_category(&category)?;
+        Command::Add { item, reason, score, kind, keywords } => {
             if reason.is_empty() {
-                anyhow::bail!("usage: aizo add <category> <item> <reason…> [--keywords k1,k2,…]");
+                anyhow::bail!("usage: aizo add <item> <reason…> [--score 0-10] [--type category] [--keywords k1,k2,…]");
             }
+            let base_score = match score {
+                Some(s) if (0.0..=10.0).contains(&s) => s,
+                Some(s) => anyhow::bail!("--score must be between 0.0 and 10.0, got {s}"),
+                None => kind.as_deref().map(|k| resolve_category(k).map(|(_, s)| s)).transpose()?.unwrap_or(9.0),
+            };
+            let cat = match kind.as_deref() {
+                Some(k) => resolve_category(k)?.0,
+                None => infer_category(base_score),
+            };
             let reason_str = reason.join(" ");
             let kws: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
-            db.upsert(cat, &item, &reason_str, &kws, default_score, "manual")?;
+            db.upsert(cat, &item, &reason_str, &kws, base_score, "manual")?;
             if kws.is_empty() {
-                println!("Added [{cat}]: \"{item}\" (base_score {default_score:.1})");
+                println!("Added [{cat}]: \"{item}\" (base_score {base_score:.1})");
             } else {
-                println!("Added [{cat}]: \"{item}\" (base_score {default_score:.1})  keywords: {}", kws.join(", "));
+                println!("Added [{cat}]: \"{item}\" (base_score {base_score:.1})  keywords: {}", kws.join(", "));
             }
         }
 
@@ -669,6 +799,7 @@ fn main() -> Result<()> {
             println!("  AIZO_API_URL    : {}", std::env::var("AIZO_API_URL").unwrap_or_else(|_| "(not set)".into()));
             println!("  AIZO_API_FORMAT : {}", std::env::var("AIZO_API_FORMAT").unwrap_or_else(|_| "(not set)".into()));
             println!("  AIZO_AUTO_KEYWORDS   : {}", std::env::var("AIZO_AUTO_KEYWORDS").unwrap_or_else(|_| "false (default)".into()));
+            println!("  AIZO_MAX_TOKENS      : {}", std::env::var("AIZO_MAX_TOKENS").unwrap_or_else(|_| "8192 (default)".into()));
             println!("Total       : {}", stats.total());
             println!("  preference: {}", stats.preferences);
             println!("  aversion  : {}", stats.aversions);

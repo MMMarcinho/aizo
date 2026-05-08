@@ -61,6 +61,17 @@ fn keywords_enabled() -> bool {
     std::env::var("AIZO_AUTO_KEYWORDS").as_deref() == Ok("true")
 }
 
+/// Controls the *output* token budget for the LLM response (the extracted JSON).
+/// The session text sent as input is unlimited — bounded only by the model's context window.
+/// 8192 is safe for all major providers (Anthropic Haiku cap, GPT-4o, local models).
+/// Raise via AIZO_MAX_TOKENS for very long sessions that produce many entries.
+fn max_tokens() -> u32 {
+    std::env::var("AIZO_MAX_TOKENS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8192)
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ExtractedEntry {
     pub category: String,
@@ -226,7 +237,7 @@ fn call_openai(model: &str, session_text: &str, existing_profile: Option<&str>, 
 
     let body = Req {
         model: model.to_string(),
-        max_tokens: 1024,
+        max_tokens: max_tokens(),
         messages: vec![
             Msg { role: "system", content: build_system(existing_profile, taxonomy) },
             Msg { role: "user",   content: build_user(session_text) },
@@ -271,7 +282,7 @@ fn call_anthropic(model: &str, session_text: &str, existing_profile: Option<&str
 
     let body = Req {
         model: model.to_string(),
-        max_tokens: 1024,
+        max_tokens: max_tokens(),
         system: build_system(existing_profile, taxonomy),
         messages: vec![Msg { role: "user", content: build_user(session_text) }],
     };
