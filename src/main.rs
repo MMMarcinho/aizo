@@ -98,6 +98,9 @@ enum Command {
         /// Comma-separated synonym keywords for richer recall (e.g. concise,brevity,minimal)
         #[arg(long, value_delimiter = ',')]
         keywords: Vec<String>,
+        /// Override the base score (0.0–10.0); defaults to category default
+        #[arg(long, short = 's')]
+        score: Option<f64>,
     },
 
     /// Add or replace keywords on an existing entry without changing its score or reason
@@ -697,18 +700,23 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Add { category, item, reason, keywords } => {
+        Command::Add { category, item, reason, keywords, score } => {
             let (cat, default_score) = resolve_category(&category)?;
             if reason.is_empty() {
-                anyhow::bail!("usage: aizo add <category> <item> <reason…> [--keywords k1,k2,…]");
+                anyhow::bail!("usage: aizo add <category> <item> <reason…> [--score 0-10] [--keywords k1,k2,…]");
             }
+            let base_score = match score {
+                Some(s) if (0.0..=10.0).contains(&s) => s,
+                Some(s) => anyhow::bail!("--score must be between 0.0 and 10.0, got {s}"),
+                None => default_score,
+            };
             let reason_str = reason.join(" ");
             let kws: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
-            db.upsert(cat, &item, &reason_str, &kws, default_score, "manual")?;
+            db.upsert(cat, &item, &reason_str, &kws, base_score, "manual")?;
             if kws.is_empty() {
-                println!("Added [{cat}]: \"{item}\" (base_score {default_score:.1})");
+                println!("Added [{cat}]: \"{item}\" (base_score {base_score:.1})");
             } else {
-                println!("Added [{cat}]: \"{item}\" (base_score {default_score:.1})  keywords: {}", kws.join(", "));
+                println!("Added [{cat}]: \"{item}\" (base_score {base_score:.1})  keywords: {}", kws.join(", "));
             }
         }
 
