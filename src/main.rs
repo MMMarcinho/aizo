@@ -95,6 +95,20 @@ enum Command {
         /// One-sentence reason (remaining words joined)
         #[arg(trailing_var_arg = true, num_args = 1..)]
         reason: Vec<String>,
+        /// Comma-separated synonym keywords for richer recall (e.g. concise,brevity,minimal)
+        #[arg(long, value_delimiter = ',')]
+        keywords: Vec<String>,
+    },
+
+    /// Add or replace keywords on an existing entry without changing its score or reason
+    Tag {
+        /// Category: preference|love, aversion|hate, habit, style, taboo
+        category: String,
+        /// Item label (case-insensitive)
+        item: String,
+        /// Keywords to set (space or comma-separated)
+        #[arg(trailing_var_arg = true, num_args = 1..)]
+        keywords: Vec<String>,
     },
 
     /// Refresh the decay clock of an existing entry without changing its score
@@ -567,14 +581,39 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Add { category, item, reason } => {
+        Command::Add { category, item, reason, keywords } => {
             let (cat, default_score) = resolve_category(&category)?;
             if reason.is_empty() {
-                anyhow::bail!("usage: aizo add <category> <item> <reason…>");
+                anyhow::bail!("usage: aizo add <category> <item> <reason…> [--keywords k1,k2,…]");
             }
             let reason_str = reason.join(" ");
-            db.upsert(cat, &item, &reason_str, &[], default_score, "manual")?;
-            println!("Added [{cat}]: \"{item}\" (base_score {default_score:.1})");
+            let kws: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
+            db.upsert(cat, &item, &reason_str, &kws, default_score, "manual")?;
+            if kws.is_empty() {
+                println!("Added [{cat}]: \"{item}\" (base_score {default_score:.1})");
+            } else {
+                println!("Added [{cat}]: \"{item}\" (base_score {default_score:.1})  keywords: {}", kws.join(", "));
+            }
+        }
+
+        Command::Tag { category, item, keywords } => {
+            let (cat, _) = resolve_category(&category)?;
+            if keywords.is_empty() {
+                anyhow::bail!("usage: aizo tag <category> <item> <keyword>…");
+            }
+            // support both space-separated and comma-separated input
+            let kws: Vec<String> = keywords
+                .iter()
+                .flat_map(|k| k.split(','))
+                .map(|k| k.trim().to_lowercase())
+                .filter(|k| !k.is_empty())
+                .collect();
+            let found = db.tag(cat, &item, &kws)?;
+            if found {
+                println!("Tagged [{cat}]: \"{item}\"  keywords: {}", kws.join(", "));
+            } else {
+                println!("Not found: [{cat}] \"{item}\"");
+            }
         }
 
         Command::Touch { category, item } => {

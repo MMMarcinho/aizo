@@ -266,6 +266,17 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Replace the keywords on an existing entry. Returns true if the entry was found.
+    pub fn tag(&self, category: &str, item: &str, keywords: &[String]) -> Result<bool> {
+        let kw = keywords.iter().map(|k| k.to_lowercase()).collect::<Vec<_>>().join(", ");
+        let n = self.conn.execute(
+            "UPDATE preferences SET keywords = ?1
+             WHERE category = ?2 AND LOWER(item) = LOWER(?3)",
+            params![kw, category, item],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Return all keywords with their entry counts, optionally filtered by category.
     pub fn all_keywords(&self, category: Option<&str>) -> Result<Vec<(String, usize)>> {
         let rows: Vec<String> = if let Some(cat) = category {
