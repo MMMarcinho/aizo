@@ -266,6 +266,44 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Replace the keywords on an existing entry. Returns true if the entry was found.
+    pub fn tag(&self, category: &str, item: &str, keywords: &[String]) -> Result<bool> {
+        let kw = keywords.iter().map(|k| k.to_lowercase()).collect::<Vec<_>>().join(", ");
+        let n = self.conn.execute(
+            "UPDATE preferences SET keywords = ?1
+             WHERE category = ?2 AND LOWER(item) = LOWER(?3)",
+            params![kw, category, item],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Return all keywords with their entry counts, optionally filtered by category.
+    pub fn all_keywords(&self, category: Option<&str>) -> Result<Vec<(String, usize)>> {
+        let rows: Vec<String> = if let Some(cat) = category {
+            let mut stmt = self.conn.prepare(
+                "SELECT keywords FROM preferences WHERE category = ?1 AND keywords != ''",
+            )?;
+            let x = stmt.query_map(params![cat], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            x
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT keywords FROM preferences WHERE keywords != ''",
+            )?;
+            let x = stmt.query_map([], |r| r.get(0))?
+                .collect::<rusqlite::Result<_>>()?;
+            x
+        };
+
+        let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        for row in rows {
+            for kw in row.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                *counts.entry(kw.to_string()).or_insert(0) += 1;
+            }
+        }
+        Ok(counts.into_iter().collect())
+    }
+
     pub fn clear(&self) -> Result<()> {
         self.conn
             .execute_batch("DELETE FROM preferences; DELETE FROM sessions;")?;

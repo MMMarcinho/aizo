@@ -5,20 +5,7 @@ const ANTHROPIC_DEFAULT_MODEL: &str = "claude-haiku-4-5-20251001";
 const ANTHROPIC_DEFAULT_URL: &str = "https://api.anthropic.com/v1/messages";
 const OPENAI_DEFAULT_URL: &str = "https://api.openai.com/v1/chat/completions";
 
-const SYSTEM_PROMPT: &str = r#"You are a user preference extraction engine. Analyze the conversation and identify the user's explicit and implicit preferences, aversions, habits, communication styles, and hard limits.
-
-Return ONLY a JSON object with this exact shape:
-{
-  "entries": [
-    {
-      "category": "<category>",
-      "item": "<short label>",
-      "reason": "<one sentence>",
-      "keywords": ["<synonym1>", "<synonym2>", ...],
-      "base_score": <0.0-10.0>
-    }
-  ]
-}
+const PROMPT_BASE: &str = r#"You are a user preference extraction engine. Analyze the conversation and identify the user's explicit and implicit preferences, aversions, habits, communication styles, and hard limits.
 
 Category definitions:
 - "preference"  — things the user consistently likes, prioritizes, or favors (base_score 7–10)
@@ -34,16 +21,45 @@ base_score scale:
   7–9  = clear preference
   10   = strong, consistent, high-priority preference
 
-keywords rules:
-- 3–6 synonyms, related terms, or paraphrases that a user might search for to find this entry
-- lowercase only
-- example for "over-engineered code": ["complexity", "bloat", "abstraction", "yagni", "indirection"]
-
 Rules:
 - Only include entries where base_score ≤ 3 OR base_score ≥ 7 — discard weak signals near neutral.
 - "item" must be a concise reusable label (≤5 words).
 - Return {"entries": []} if no strong signals detected.
 - Raw JSON only — no markdown fences, no explanation."#;
+
+const SCHEMA_NO_KW: &str = r#"Return ONLY a JSON object with this exact shape:
+{
+  "entries": [
+    {
+      "category": "<category>",
+      "item": "<short label>",
+      "reason": "<one sentence>",
+      "base_score": <0.0-10.0>
+    }
+  ]
+}"#;
+
+const SCHEMA_WITH_KW: &str = r#"Return ONLY a JSON object with this exact shape:
+{
+  "entries": [
+    {
+      "category": "<category>",
+      "item": "<short label>",
+      "reason": "<one sentence>",
+      "keywords": ["<synonym1>", "<synonym2>", ...],
+      "base_score": <0.0-10.0>
+    }
+  ]
+}
+
+keywords rules:
+- 3–6 synonyms, related terms, or paraphrases that a user might search for to find this entry
+- lowercase only
+- example for "over-engineered code": ["complexity", "bloat", "abstraction", "yagni", "indirection"]"#;
+
+fn keywords_enabled() -> bool {
+    std::env::var("AIZO_AUTO_KEYWORDS").as_deref() == Ok("true")
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 pub struct ExtractedEntry {
@@ -62,14 +78,25 @@ pub struct ExtractionResult {
 
 // ── Prompt construction ───────────────────────────────────────────────────────
 
-fn build_system(existing_profile: Option<&str>) -> String {
-    match existing_profile {
-        Some(p) => format!(
-            "{}\n\nAlready-stored preferences (reference only — skip re-extracting unless meaningfully changed):\n{}",
-            SYSTEM_PROMPT, p
-        ),
-        None => SYSTEM_PROMPT.to_string(),
+fn build_system(existing_profile: Option<&str>, taxonomy: Option<&[String]>) -> String {
+    let schema = if keywords_enabled() { SCHEMA_WITH_KW } else { SCHEMA_NO_KW };
+    let mut out = format!("{schema}\n\n{PROMPT_BASE}");
+
+    if keywords_enabled() {
+        if let Some(terms) = taxonomy {
+            if !terms.is_empty() {
+                out.push_str(
+                    "\n\nKeyword taxonomy — select keywords ONLY from this list (do not invent new ones):\n",
+                );
+                out.push_str(&terms.join(", "));
+            }
+        }
     }
+    if let Some(p) = existing_profile {
+        out.push_str("\n\nAlready-stored preferences (reference only — skip re-extracting unless meaningfully changed):\n");
+        out.push_str(p);
+    }
+    out
 }
 
 fn build_user(session_text: &str) -> String {
@@ -80,8 +107,8 @@ fn build_user(session_text: &str) -> String {
 ///
 /// Suitable for piping to any CLI LLM or pasting into a chat UI.
 /// The model's response should be piped to `aizo import`.
-pub fn extraction_prompt(session_text: &str, existing_profile: Option<&str>) -> String {
-    format!("{}\n\n{}", build_system(existing_profile), build_user(session_text))
+pub fn extraction_prompt(session_text: &str, existing_profile: Option<&str>, taxonomy: Option<&[String]>) -> String {
+    format!("{}\n\n{}", build_system(existing_profile, taxonomy), build_user(session_text))
 }
 
 // ── Result parsing ────────────────────────────────────────────────────────────
@@ -131,8 +158,7 @@ fn use_anthropic_format() -> bool {
 
 /// Send a minimal request to verify the LLM is reachable and the key works.
 pub fn test_connection() -> Result<()> {
-    // A bare greeting produces {"entries":[]} — valid JSON, no side effects.
-    analyze("User: hi", None)?;
+    analyze("User: hi", None, None)?;
     Ok(())
 }
 
@@ -145,7 +171,7 @@ pub fn test_connection() -> Result<()> {
 ///   AIZO_API_FORMAT — "anthropic" to force Anthropic wire format; otherwise OpenAI-compatible
 ///
 /// For no-LLM workflows, use `aizo extract | <llm> | aizo import` instead.
-pub fn analyze(session_text: &str, existing_profile: Option<&str>) -> Result<ExtractionResult> {
+pub fn analyze(session_text: &str, existing_profile: Option<&str>, taxonomy: Option<&[String]>) -> Result<ExtractionResult> {
     let anthropic = use_anthropic_format();
 
     let model = std::env::var("AIZO_MODEL").unwrap_or_else(|_| {
@@ -169,9 +195,9 @@ pub fn analyze(session_text: &str, existing_profile: Option<&str>) -> Result<Ext
     }
 
     let raw = if anthropic {
-        call_anthropic(&model, session_text, existing_profile)?
+        call_anthropic(&model, session_text, existing_profile, taxonomy)?
     } else {
-        call_openai(&model, session_text, existing_profile)?
+        call_openai(&model, session_text, existing_profile, taxonomy)?
     };
 
     parse_result(&raw)
@@ -179,7 +205,7 @@ pub fn analyze(session_text: &str, existing_profile: Option<&str>) -> Result<Ext
 
 // ── Wire formats ──────────────────────────────────────────────────────────────
 
-fn call_openai(model: &str, session_text: &str, existing_profile: Option<&str>) -> Result<String> {
+fn call_openai(model: &str, session_text: &str, existing_profile: Option<&str>, taxonomy: Option<&[String]>) -> Result<String> {
     let api_url = std::env::var("AIZO_API_URL")
         .unwrap_or_else(|_| OPENAI_DEFAULT_URL.to_string());
     let api_key = std::env::var("AIZO_API_KEY")
@@ -202,7 +228,7 @@ fn call_openai(model: &str, session_text: &str, existing_profile: Option<&str>) 
         model: model.to_string(),
         max_tokens: 1024,
         messages: vec![
-            Msg { role: "system", content: build_system(existing_profile) },
+            Msg { role: "system", content: build_system(existing_profile, taxonomy) },
             Msg { role: "user",   content: build_user(session_text) },
         ],
     };
@@ -227,7 +253,7 @@ fn call_openai(model: &str, session_text: &str, existing_profile: Option<&str>) 
         .context("empty choices in API response")
 }
 
-fn call_anthropic(model: &str, session_text: &str, existing_profile: Option<&str>) -> Result<String> {
+fn call_anthropic(model: &str, session_text: &str, existing_profile: Option<&str>, taxonomy: Option<&[String]>) -> Result<String> {
     let api_url = std::env::var("AIZO_API_URL")
         .unwrap_or_else(|_| ANTHROPIC_DEFAULT_URL.to_string());
     let api_key = std::env::var("AIZO_API_KEY")
@@ -246,7 +272,7 @@ fn call_anthropic(model: &str, session_text: &str, existing_profile: Option<&str
     let body = Req {
         model: model.to_string(),
         max_tokens: 1024,
-        system: build_system(existing_profile),
+        system: build_system(existing_profile, taxonomy),
         messages: vec![Msg { role: "user", content: build_user(session_text) }],
     };
 
