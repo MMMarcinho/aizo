@@ -4,6 +4,40 @@ Use this skill whenever you interact with a user who has aizo installed. aizo is
 lightweight preference memory tool: it stores what the user loves, hates, and has
 set as hard limits, with a time-decay mechanism so recent signals carry more weight.
 
+## How aizo fits into the agent ecosystem
+
+aizo operates in two complementary loops. Understand which loop you are in:
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║  Loop 1 — In-session  (you are here during a live conversation)      ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+   user ──► agent (you) ──── aizo add ───────────────────┐
+                                                          ▼
+                          CLAUDE.md ◄── contributes ── local SQLite
+
+
+╔══════════════════════════════════════════════════════════════════════╗
+║  Loop 2 — Background  (cron job, runs outside live sessions)         ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+   accumulated sessions ── aizo analyze ─────────────────┐
+                                                          ▼
+   USER.md, SOUL.md, IDENTITY.md … ◄── contributes ── local SQLite
+```
+
+**Loop 1 (SOPs 1–6):** you run live. Detect preference signals, write them with
+`aizo add`, recall before generating, and batch-analyze the session transcript at the end.
+The profile flows back into `CLAUDE.md` so the next session starts informed.
+
+**Loop 2 (SOP 7):** a scheduled cron job processes accumulated session transcripts with
+`aizo analyze`. The enriched profile is then used to maintain richer identity files
+(`USER.md`, `SOUL.md`, `IDENTITY.md`, etc.) that persist the user's evolving persona
+across all agents and tools.
+
+The SOPs below cover both loops. SOPs 1–6 are for live sessions; SOP 7 is for the cron job.
+
 TRIGGER: automatically apply this SOP at session start and on any of the events below.
 
 ---
@@ -45,7 +79,7 @@ as time passes.
 1. Identify the specific behaviour they rejected (1 short label).
 2. Write it immediately — do not wait:
 ```bash
-aizo add aversion "<what was rejected>" "<their words, paraphrased in one sentence>"
+aizo add "<what was rejected>" "<their words, paraphrased in one sentence>" --score 2.0
 ```
 3. Recall relevant preferences for the corrected reply:
 ```bash
@@ -68,7 +102,7 @@ aizo recall "<topic of current task>" --type taboo
 1. Identify what specifically they praised.
 2. Reinforce it:
 ```bash
-aizo add preference "<what was praised>" "<their words, paraphrased>"
+aizo add "<what was praised>" "<their words, paraphrased>" --score 9.0
 ```
 
 Do this *after* sending the reply, not before — positive reinforcement is async.
@@ -94,9 +128,9 @@ This is different from inferred preferences — these are commands, not signals.
 
 2. Write immediately and synchronously, before generating your reply:
 ```bash
-aizo add taboo "<the rule>"    "<their exact instruction, quoted>"
+aizo add "<the rule>" "<their exact instruction, quoted>" --type taboo
 # OR
-aizo add preference "<the rule>" "<their exact instruction, quoted>"
+aizo add "<the rule>" "<their exact instruction, quoted>" --score 10.0
 ```
 
 3. Acknowledge the rule explicitly in your reply: "Got it, I'll always X from now on."

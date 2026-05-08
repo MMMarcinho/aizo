@@ -8,6 +8,47 @@ It mimics human cognitive memory: rather than storing full conversation transcri
 
 ---
 
+## How it fits together
+
+aizo is designed for two complementary usage loops:
+
+```
+╔══════════════════════════════════════════════════════════════════════╗
+║  1. In-session  (reactive — detects specific emotions in real time)  ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+   user ──► Claude Code ──── aizo add ────────────────────┐
+                                                           ▼
+                             CLAUDE.md ◄── contributes ── local SQLite
+                                                      (user preference)
+
+
+╔══════════════════════════════════════════════════════════════════════╗
+║  2. Background  (cron task — batch-analyzes accumulated sessions)    ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+   user ──► openclaw ──► sessions ── aizo analyze ─────────┐
+                                                            ▼
+   USER.md, SOUL.md, IDENTITY.md … ◄── contributes ── local SQLite
+                                                      (user preference)
+```
+
+**Loop 1 — In-session:** the agent detects a strong preference signal mid-conversation
+(praise, complaint, explicit rule) and calls `aizo add` immediately. The updated SQLite
+profile is then injected into `CLAUDE.md` (or equivalent context file) so the next
+session starts with the latest understanding of the user.
+
+**Loop 2 — Background:** other agents (openclaw, etc.) accumulate session transcripts
+over time. A scheduled cron job runs `aizo analyze` to extract implicit preferences the
+reactive loop may have missed. The enriched profile is then written into richer identity
+files — `USER.md`, `SOUL.md`, `IDENTITY.md` — that build a persistent, evolving
+picture of the user across all agents and tools.
+
+The two loops reinforce each other: reactive writes give immediate recall accuracy;
+batch analysis fills in the gaps and stabilises scores over time.
+
+---
+
 ## Core design
 
 ```
@@ -114,7 +155,7 @@ aizo [--db <path>] <COMMAND>
 | `recall <query>` | Keyword recall sorted by effective weight — **primary agent call** |
 | `top [N]` | Top-N entries by effective weight (default 10) |
 | `show` | Full profile as JSON, sorted by effective weight |
-| `add <category> <item> <reason…>` | Manually add or update a preference |
+| `add <item> <reason…> [--score N] [--type cat]` | Manually add or update a preference |
 | `touch <category> <item…>` | Reset decay clock without changing score |
 | `remove <category> <item…>` | Hard-remove an entry |
 | `clear` | Wipe entire profile and session history |
@@ -147,12 +188,12 @@ aizo recall "code style"
 # Inspect full profile
 aizo show
 
-# Manual entries
-aizo add love "concise code"    "Always asks for shorter implementations"
-aizo add hate "verbose comments" "Complained about over-documented code multiple times"
-aizo add taboo "emojis in output" "Explicitly said never use emojis"
-aizo add habit "uses dark mode"  "Mentioned dark theme in every UI session"
-aizo add style "terse naming"    "Consistently chose short variable names"
+# Manual entries — category inferred from score
+aizo add "concise code"    "Always asks for shorter implementations"  --score 9.0
+aizo add "verbose comments" "Complained about over-documented code"   --score 1.5
+aizo add "emojis in output" "Explicitly said never use emojis"        --type taboo
+aizo add "uses dark mode"  "Mentioned dark theme in every UI session" --score 5.0
+aizo add "terse naming"    "Consistently chose short variable names"  --type style --score 8.0
 
 # Tune decay (default: half-life 30d, floor 0.1)
 aizo config set-half-life 14
