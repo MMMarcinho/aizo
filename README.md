@@ -17,7 +17,7 @@ aizo is designed for two complementary usage loops:
 ║  1. In-session  (reactive — detects specific emotions in real time)  ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-   user ──► Claude Code ──── aizo add ────────────────────┐
+   user ──► Claude Code ─────── aizo add ──────────────────┐
                                                            ▼
                              CLAUDE.md ◄── contributes ── local SQLite
                                                       (user preference)
@@ -27,7 +27,7 @@ aizo is designed for two complementary usage loops:
 ║  2. Background  (cron task — batch-analyzes accumulated sessions)    ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-   user ──► openclaw ──► sessions ── aizo analyze ─────────┐
+   user ──► openclaw ──► sessions ─── aizo analyze ─────────┐
                                                             ▼
    USER.md, SOUL.md, IDENTITY.md … ◄── contributes ── local SQLite
                                                       (user preference)
