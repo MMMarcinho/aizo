@@ -9,7 +9,7 @@ const bin = path.join(__dirname, "bin", process.platform === "win32" ? "aizo.exe
 
 if (!fs.existsSync(bin)) {
   console.error(
-    "[aizo] Binary not found. Try reinstalling: npm install aizo\n" +
+    "[aizo] Binary not found. Try reinstalling: npm install aizo-node\n" +
     "Or install via Cargo: cargo install aizo"
   );
   process.exit(1);
