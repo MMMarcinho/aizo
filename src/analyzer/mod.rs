@@ -124,10 +124,42 @@ pub fn extraction_prompt(session_text: &str, existing_profile: Option<&str>, tax
 
 // ── Result parsing ────────────────────────────────────────────────────────────
 
+/// Normalize reasoning-model output before JSON parsing.
+///
+/// Handles:
+/// - `<think>...</think>` blocks (DeepSeek R1, QwQ, etc.)
+/// - Text before/after the JSON object (MiniMax-M2.7, etc.)
+///
+/// Strategy: find the first `{` and last `}`, extract that substring, then
+/// let the caller validate the schema.  This is intentionally lenient on
+/// surrounding text and strict on the extracted JSON structure.
+fn normalize(text: &str) -> &str {
+    // Strip <think>...</think> blocks (may be nested in reasoning models)
+    let text = if text.contains("</think>") {
+        if let Some(pos) = text.find("</think>") {
+            &text[pos + "</think>".len()..]
+        } else {
+            text
+        }
+    } else {
+        text
+    };
+
+    // Find the JSON object: first `{` to last `}`
+    let start = text.find('{');
+    let end = text.rfind('}');
+    match (start, end) {
+        (Some(s), Some(e)) if s < e => &text[s..=e],
+        _ => text,
+    }
+}
+
 /// Parse and validate an LLM JSON response into structured entries.
 pub fn parse_result(text: &str) -> Result<ExtractionResult> {
+    let normalized = normalize(text);
+
     // Strip markdown fences if the model wrapped its output anyway
-    let trimmed = text.trim();
+    let trimmed = normalized.trim();
     let json_str = trimmed
         .strip_prefix("```json")
         .or_else(|| trimmed.strip_prefix("```"))
