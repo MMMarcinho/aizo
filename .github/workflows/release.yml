@@ -85,13 +85,12 @@ jobs:
           node-version: "20"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Sync version from Cargo.toml
+      - name: Sync version from git tag
         run: |
-          VERSION=$(grep '^version' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
           node -e "
             const fs = require('fs');
             const p = JSON.parse(fs.readFileSync('npm/package.json','utf8'));
-            p.version = process.env.VERSION;
+            p.version = process.env.VERSION.replace(/^v/, '');
             fs.writeFileSync('npm/package.json', JSON.stringify(p, null, 2) + '\n');
           "
         env:
