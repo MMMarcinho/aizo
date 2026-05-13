@@ -132,18 +132,53 @@ aizo top 5 --type preference
 
 ## 安装
 
-### 从源码编译（需要 Rust ≥ 1.70）
-
 ```bash
+# Cargo（推荐）
+cargo install aizo
+
+# npm / npx
+npm install -g aizo
+npx aizo top 10
+
+# 从源码编译（需要 Rust ≥ 1.70）
 git clone https://github.com/mmmarcinho/aizo
-cd aizo
-cargo build --release
+cd aizo && cargo build --release
 cp target/release/aizo /usr/local/bin/aizo
 ```
 
+### 初次配置
+
+运行交互向导——自动写入 `~/.aizo/.env` 并测试连接：
+
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...   # analyze 命令必需
+aizo init
 ```
+
+或手动设置环境变量：
+
+```bash
+# Anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# 任意 OpenAI 兼容模型（Ollama、OpenRouter、DeepSeek、vLLM…）
+export AIZO_MODEL=qwen2.5:7b
+export AIZO_API_URL=http://localhost:11434/v1/chat/completions
+```
+
+### 配置环境变量
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `AIZO_DB_PATH` | `~/.aizo/preferences.db` | SQLite 数据库路径 |
+| `ANTHROPIC_API_KEY` | — | Anthropic API 密钥（自动检测） |
+| `AIZO_API_KEY` | — | 任意提供商的 API 密钥 |
+| `AIZO_API_URL` | 提供商默认值 | LLM 端点 URL |
+| `AIZO_MODEL` | `claude-haiku-4-5` | 模型名称 |
+| `AIZO_API_FORMAT` | 自动 | `anthropic` 强制使用 Anthropic 协议 |
+| `AIZO_MAX_TOKENS` | `8192` | LLM 最大输出 token 数 |
+| `AIZO_AUTO_KEYWORDS` | `false` | `true` 启用 LLM 自动生成关键词 |
+
+所有变量均可在 `~/.aizo/.env`（用户级）或 `./.env`（项目级）中设置。Shell 环境变量优先级最高。
 
 ---
 
@@ -155,20 +190,35 @@ aizo [--db <路径>] <命令>
 
 | 命令 | 说明 |
 |---|---|
-| `analyze [文件]` | 用 Flash LLM 分析会话文件或 JSON 导出 |
-| `recall [关键词] [--type …] [--limit N] [--scenario …]` | 关键词+分数范围召回 — **智能体核心调用** |
-| `top [N] [--type …]` | 按有效权重排列的前 N 条（默认 10） |
+| `init` | 交互式配置向导——写入 `~/.aizo/.env`，测试连接 |
+| `analyze [文件]` | 用 LLM 分析会话文件或 JSON/JSONL 导出 |
+| `extract [文件]` | 将提取提示词输出到 stdout（可接管道给任意 LLM） |
+| `import` | 从 stdin 读取 `{"entries":[…]}` JSON 并批量写入 |
+| `recall [查询]` | 关键词+分数范围召回 — **智能体核心调用** |
+| `top [N]` | 按有效权重排列的前 N 条（默认 10） |
 | `show` | 输出完整画像，按有效权重排序 |
-| `add <标签> <原因> [--score N]` | 手动添加或更新一条偏好（原因须加引号） |
+| `add <标签> <原因>` | 手动添加或更新一条偏好（原因须加引号） |
 | `tag <标签> <关键词…>` | 为已有词条添加或替换关键词 |
 | `touch <标签…>` | 重置衰减时钟，不修改分数 |
 | `remove <标签…>` | 硬删除一条词条 |
 | `keywords` | 列出所有已存储的关键词及词条数 |
 | `clear` | 清空整个画像和会话历史 |
 | `info` | 显示数据库路径、分数分布、衰减配置 |
-| `config show` | 显示衰减配置 |
-| `config set-half-life <天数>` | 设置衰减半衰期 |
-| `config set-floor <0.0–1.0>` | 设置衰减下限 |
+| `config show/set-half-life/set-floor` | 查看或设置衰减参数 |
+
+**`recall` 标志：**
+
+| 标志 | 说明 |
+|---|---|
+| `--type/-t <类型>` | 分数范围过滤，逗号分隔：`preference`、`style`、`habit`、`aversion`、`taboo` |
+| `--limit/-l <N>` | 按有效权重排序后限制返回数量 |
+| `--scenario <名称>` | 扩展为预设关键词列表：`coding`、`writing`、`communication` |
+| `--no-touch` | 不刷新匹配词条的 `last_seen` |
+| `--json` | 输出原始 JSON（供程序调用） |
+
+**`top` / `show` / `recall` 标志：** `--json` 输出原始 JSON。
+
+**`top` 标志：** `--type/-t` 分数范围过滤，同 recall。
 
 ### 使用示例
 
@@ -275,12 +325,23 @@ import subprocess, json
 def top_preferences(n: int = 10) -> list[dict]:
     return json.loads(subprocess.check_output(["aizo", "top", str(n), "--json"]))
 
-def recall(query: str) -> list[dict]:
-    return json.loads(subprocess.check_output(["aizo", "recall", query, "--json"]))
+def recall(query: str, types: str = "preference,style,habit,taboo") -> list[dict]:
+    return json.loads(subprocess.check_output(
+        ["aizo", "recall", query, "--type", types, "--json"]
+    ))
+
+def recall_scenario(scenario: str) -> list[dict]:
+    return json.loads(subprocess.check_output(
+        ["aizo", "recall", "--scenario", scenario,
+         "--type", "preference,style,habit,taboo", "--limit", "20", "--json"]
+    ))
 
 # 生成前注入系统提示
-prefs = top_preferences(10)
+prefs = top_preferences(20)
 system = f"用户偏好：\n{json.dumps(prefs, indent=2, ensure_ascii=False)}\n\n{base_system}"
+
+# 写代码前检查编程偏好
+coding_prefs = recall_scenario("coding")
 ```
 
 通过环境变量为每个项目维护独立画像：
@@ -304,7 +365,7 @@ aizo show
 | 2 | 用户表达负面反馈 | `aizo add … --score 1.5` 再 `aizo recall <主题>` | 同步，修正回复前 |
 | 3 | 用户表达称赞 | `aizo add … --score 9.0` | 异步，回复发送后 |
 | 4 | 用户下达明确指令 | `aizo add … --score 0.5` 或 `--score 10` | 同步，立即执行 |
-| 5 | 即将针对主题 X 生成内容 | `aizo recall <X>` | 同步，生成前 |
+| 5 | 即将针对主题 X 生成内容 | `aizo recall --scenario <X>` 或 `aizo recall <X> --type preference,style,taboo` | 同步，生成前 |
 | 6 | 会话结束 | `aizo analyze <对话记录>` | 异步，后台执行 |
 | 7 | 每日定时任务 | 智能体 LLM 扫描日志 → `aizo touch` 确认词条 | 定时，后台执行 |
 

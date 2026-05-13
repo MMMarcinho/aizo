@@ -48,18 +48,17 @@ Run once before your first response. Pull the user's current preference profile 
 inject it as a compact block into your working context.
 
 ```bash
-aizo top 20
+aizo top 20 --json
 ```
 
-Format the JSON output into a short header like this — do not paste raw JSON:
+Format the JSON output into a short prose header — do not paste raw JSON:
 
 ```
 [User Preferences]
-Loves (high weight first): concise code (9.0), terse naming (8.0)
-Hates: verbose comments (1.0), long PRs (1.2)
-Hard limits (taboo): never use emojis in output
-Habits: uses dark mode, prefers CLI tools
-Style: short sentences, no jargon
+Strong likes (weight ≥ 7): concise code (9.0), terse naming (8.0)
+Dislikes (weight ≤ 4): verbose comments (1.0), long PRs (1.2)
+Hard limits (weight ≤ 1.5): never use emojis in output
+Neutral habits: uses dark mode, prefers CLI tools
 ```
 
 Inject this block at the top of your system context. Re-run at the start of each
@@ -128,8 +127,9 @@ This is different from inferred preferences — these are commands, not signals.
 
 2. Write immediately and synchronously, before generating your reply:
 ```bash
-aizo add "<the rule>" "<their exact instruction, quoted>" --type taboo
-# OR
+# Hard limit ("never", "don't ever") — score near 0
+aizo add "<the rule>" "<their exact instruction, quoted>" --score 0.5
+# Strong preference ("always", "I want you to always") — score 10
 aizo add "<the rule>" "<their exact instruction, quoted>" --score 10.0
 ```
 
@@ -251,7 +251,7 @@ Use `analyze` to **learn**. Use `touch` (via cron) to **remember**.
 When preferences conflict (e.g. recall returns both a preference and an aversion on
 the same topic), apply this order:
 
-1. **Taboo** (score 0–2) — always wins, no exceptions
+1. **Taboo** (score 0–1.5) — always wins, no exceptions
 2. **Explicit instruction** (source: manual, score 10) — overrides analysis
 3. **High effective weight** — higher `effective_weight` breaks ties
 4. **Recency** — if weights are close, `last_seen` breaks the tie
