@@ -78,15 +78,11 @@ enum Command {
     },
 
     /// Manually add or update a preference
-    ///
-    /// Category is inferred from --score when --type is omitted:
-    ///   0.0–1.5 → taboo, 1.6–4.0 → aversion, 4.1–6.5 → habit, 6.6–10.0 → preference
     Add {
         /// Short item label (e.g. "dark mode", "verbose comments")
         item: String,
-        /// One-sentence reason (remaining words joined)
-        #[arg(trailing_var_arg = true, num_args = 1..)]
-        reason: Vec<String>,
+        /// One-sentence reason why this entry matters (must be quoted if it contains spaces)
+        reason: String,
         /// Base score 0.0–10.0 (defaults to 9.0)
         #[arg(long, short = 's')]
         score: Option<f64>,
@@ -648,17 +644,13 @@ fn main() -> Result<()> {
         }
 
         Command::Add { item, reason, score, keywords } => {
-            if reason.is_empty() {
-                anyhow::bail!("usage: aizo add <item> <reason…> [--score 0-10] [--keywords k1,k2,…]");
-            }
             let base_score = match score {
                 Some(s) if (0.0..=10.0).contains(&s) => s,
                 Some(s) => anyhow::bail!("--score must be between 0.0 and 10.0, got {s}"),
                 None => 9.0,
             };
-            let reason_str = reason.join(" ");
             let kws: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
-            db.upsert(&item, &reason_str, &kws, base_score, "manual")?;
+            db.upsert(&item, &reason, &kws, base_score, "manual")?;
             let label = score_label(base_score);
             if kws.is_empty() {
                 println!("Added [{label}]: \"{item}\" (score {base_score:.1})");

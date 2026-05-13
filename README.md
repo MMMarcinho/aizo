@@ -155,7 +155,7 @@ aizo [--db <path>] <COMMAND>
 | `recall <query>` | Keyword recall sorted by effective weight — **primary agent call** |
 | `top [N]` | Top-N entries by effective weight (default 10) |
 | `show` | Full profile sorted by effective weight |
-| `add <item> <reason…> [--score N]` | Manually add or update a preference |
+| `add <item> <reason> [--score N]` | Manually add or update a preference |
 | `tag <item> <keywords…>` | Add or replace keywords on an existing entry |
 | `touch <item…>` | Reset decay clock without changing score |
 | `remove <item…>` | Hard-remove an entry |
