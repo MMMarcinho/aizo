@@ -152,8 +152,8 @@ aizo [--db <path>] <COMMAND>
 | Command | Description |
 |---|---|
 | `analyze [file]` | Analyze session file or JSON export with flash LLM |
-| `recall <query>` | Keyword recall sorted by effective weight — **primary agent call** |
-| `top [N]` | Top-N entries by effective weight (default 10) |
+| `recall [query] [--type …] [--limit N] [--scenario …]` | Keyword + score-range recall — **primary agent call** |
+| `top [N] [--type …]` | Top-N entries by effective weight (default 10) |
 | `show` | Full profile sorted by effective weight |
 | `add <item> <reason> [--score N]` | Manually add or update a preference |
 | `tag <item> <keywords…>` | Add or replace keywords on an existing entry |
@@ -170,13 +170,21 @@ aizo [--db <path>] <COMMAND>
 
 There is no `category` field. The `base_score` is the only dimension that matters:
 
-| Score | Meaning |
-|---|---|
-| 0–1.5 | Hard limit / must never do |
-| 1.6–3 | Clear dislike |
-| 4–6 | Neutral habit or weak pattern |
-| 7–8.5 | Clear preference |
-| 9–10 | Strong, consistent, high-priority love |
+| Score | Meaning | `--type` alias |
+|---|---|---|
+| 0–1.5 | Hard limit / must never do | `taboo` |
+| 1.6–4 | Clear dislike | `aversion` |
+| 4–6.5 | Neutral habit or weak pattern | `habit` |
+| 6.5–10 | Style / communication preference | `style` |
+| 7–10 | Clear preference | `preference` |
+
+Use `--type` on `recall` and `top` to filter by score range. Comma-separate for multi-type:
+
+```bash
+aizo recall code --type preference,habit,style,taboo
+aizo recall --type taboo               # all hard limits, no keyword needed
+aizo top 5 --type preference
+```
 
 Use keywords (`--keywords` on add, or `aizo tag`) to add any taxonomy you want.
 
@@ -187,9 +195,17 @@ Use keywords (`--keywords` on add, or `aizo tag`) to add any taxonomy you want.
 aizo analyze ./chat.txt
 cat conversation.md | aizo analyze
 
-# Agent recalls top preferences before generating
+# Agent recalls preferences before generating
 aizo top 5
 aizo recall "code style"
+
+# Scenario-aware recall for coding tasks (expands to ~10 coding keywords)
+aizo recall --scenario coding --type preference,style,habit,taboo --limit 20
+
+# Type-only recall (no keyword — returns all entries in that score range)
+aizo recall --type taboo                        # all hard limits
+aizo recall code --type preference --limit 10   # top coding preferences
+aizo recall code --type preference,habit --limit 20  # multiple types
 
 # Inspect full profile
 aizo show

@@ -49,9 +49,21 @@ enum Command {
     Import,
 
     /// Recall preferences matching a keyword, sorted by effective weight  [primary agent use]
+    ///
+    /// --type maps to score ranges: preference(≥7), style(≥6.5), habit(4–7), aversion(1.5–4), taboo(≤1.5)
+    /// --scenario expands to a preset keyword list: coding, writing, communication
     Recall {
-        /// Keyword matched against item, reason, AND synonyms (case-insensitive)
-        query: String,
+        /// Keyword matched against item, reason, AND synonyms; omit to filter by type/scenario only
+        query: Option<String>,
+        /// Score-range filter (repeatable or comma-separated): preference, style, habit, aversion, taboo
+        #[arg(long = "type", short = 't', value_delimiter = ',')]
+        types: Vec<String>,
+        /// Max results to return
+        #[arg(long, short = 'l')]
+        limit: Option<usize>,
+        /// Scenario preset — expands to relevant keyword queries: coding, writing, communication
+        #[arg(long)]
+        scenario: Option<String>,
         /// Do not refresh last_seen for matched entries
         #[arg(long)]
         no_touch: bool,
@@ -65,6 +77,9 @@ enum Command {
         /// Number of entries to show (default: 10)
         #[arg(default_value = "10")]
         n: usize,
+        /// Score-range filter (repeatable or comma-separated): preference, style, habit, aversion, taboo
+        #[arg(long = "type", short = 't', value_delimiter = ',')]
+        types: Vec<String>,
         /// Output raw JSON instead of human-readable text
         #[arg(long)]
         json: bool,
@@ -304,7 +319,7 @@ fn read_text(file: Option<PathBuf>) -> Result<String> {
 }
 
 fn profile_context(db: &Db) -> Result<Option<String>> {
-    let prefs = db.top(20)?;
+    let prefs = db.top(20, &[])?;
     Ok(if prefs.is_empty() {
         None
     } else {
@@ -322,6 +337,41 @@ fn format_profile_context(prefs: &[Preference]) -> String {
 
 fn score_label(score: f64) -> &'static str {
     if score >= 7.0 { "liked" } else if score <= 3.0 { "disliked" } else { "neutral" }
+}
+
+/// Map a type name to a (min, max) base_score range (inclusive).
+fn type_score_range(t: &str) -> Result<(f64, f64)> {
+    match t.trim() {
+        "preference" | "pref" | "like" | "love" => Ok((7.0, 10.0)),
+        "style"                                  => Ok((6.5, 10.0)),
+        "habit"  | "neutral"                     => Ok((4.0, 7.0)),
+        "aversion" | "avers" | "dislike" | "hate"=> Ok((1.5, 4.0)),
+        "taboo"  | "limit"  | "hard"             => Ok((0.0, 1.5)),
+        other => anyhow::bail!(
+            "unknown type '{other}'. Use: preference, style, habit, aversion, taboo"
+        ),
+    }
+}
+
+/// Expand a scenario name into a list of keyword queries.
+fn scenario_queries(name: &str) -> Result<Vec<&'static str>> {
+    match name.trim() {
+        "coding" | "code" | "dev" | "development" => Ok(vec![
+            "code", "coding", "style", "naming", "format",
+            "test", "debug", "refactor", "review", "architecture",
+        ]),
+        "writing" | "docs" | "documentation" => Ok(vec![
+            "writing", "docs", "documentation", "format",
+            "tone", "style", "clarity", "length", "language",
+        ]),
+        "communication" | "chat" | "social" | "meeting" => Ok(vec![
+            "communication", "meeting", "message", "response",
+            "tone", "team", "email", "reply", "social",
+        ]),
+        other => anyhow::bail!(
+            "unknown scenario '{other}'. Built-in scenarios: coding, writing, communication"
+        ),
+    }
 }
 
 fn print_entries(entries: &[Preference], json: bool) {
@@ -616,17 +666,36 @@ fn main() -> Result<()> {
             print_analyze_summary(&result.entries);
         }
 
-        Command::Recall { query, no_touch, json } => {
-            let prefs = db.recall(&query, !no_touch)?;
+        Command::Recall { query, types, limit, scenario, no_touch, json } => {
+            // Build keyword query list: scenario expansion + optional explicit query
+            let scenario_qs: Vec<&'static str> = match scenario.as_deref() {
+                Some(s) => scenario_queries(s)?,
+                None    => vec![],
+            };
+            let explicit: Vec<&str> = query.as_deref().map(|q| vec![q]).unwrap_or_default();
+            let all_queries: Vec<&str> = scenario_qs.iter().copied().chain(explicit).collect();
+
+            // Parse type → score ranges
+            let ranges: Vec<(f64, f64)> = types.iter()
+                .map(|t| type_score_range(t))
+                .collect::<Result<_>>()?;
+
+            let prefs = db.recall(&all_queries, &ranges, limit, !no_touch)?;
             if prefs.is_empty() {
-                println!("No preferences matched \"{query}\".");
+                let scope = if types.is_empty() { String::new() }
+                            else { format!(" [{}]", types.join(", ")) };
+                let what  = query.as_deref().unwrap_or(scenario.as_deref().unwrap_or("*"));
+                println!("No preferences matched \"{what}\"{scope}.");
             } else {
                 print_entries(&prefs, json);
             }
         }
 
-        Command::Top { n, json } => {
-            let prefs = db.top(n)?;
+        Command::Top { n, types, json } => {
+            let ranges: Vec<(f64, f64)> = types.iter()
+                .map(|t| type_score_range(t))
+                .collect::<Result<_>>()?;
+            let prefs = db.top(n, &ranges)?;
             if prefs.is_empty() {
                 println!("No preferences recorded yet.");
             } else {

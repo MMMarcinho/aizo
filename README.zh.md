@@ -98,15 +98,23 @@ $$\boxed{w = s \cdot \left[\phi + (1-\phi) \cdot e^{-\lambda t}\right]^{\frac{10
 
 ### 分数量表（0–10）
 
-没有"类别"字段。`base_score` 是唯一的情感维度：
+没有"类别"字段。`base_score` 是唯一的情感维度，也是 `--type` 过滤的依据：
 
-| 分数 | 含义 |
-|---|---|
-| 0–1.5 | 硬性边界 / 绝对禁忌 |
-| 1.6–3 | 明确厌恶 |
-| 4–6 | 中性倾向 / 弱习惯 |
-| 7–8.5 | 明确偏好 |
-| 9–10 | 强烈、一贯、高优先级的喜爱 |
+| 分数 | 含义 | `--type` 别名 |
+|---|---|---|
+| 0–1.5 | 硬性边界 / 绝对禁忌 | `taboo` |
+| 1.6–4 | 明确厌恶 | `aversion` |
+| 4–6.5 | 中性倾向 / 弱习惯 | `habit` |
+| 6.5–10 | 风格 / 沟通偏好 | `style` |
+| 7–10 | 明确偏好 | `preference` |
+
+在 `recall` 和 `top` 中使用 `--type` 按分数范围过滤，逗号分隔可多选：
+
+```bash
+aizo recall code --type preference,habit,style,taboo
+aizo recall --type taboo               # 列出所有硬性边界
+aizo top 5 --type preference
+```
 
 使用 `--keywords`（`add` 时）或 `aizo tag` 添加任意分类标签。
 
@@ -148,8 +156,8 @@ aizo [--db <路径>] <命令>
 | 命令 | 说明 |
 |---|---|
 | `analyze [文件]` | 用 Flash LLM 分析会话文件或 JSON 导出 |
-| `recall <关键词>` | 按有效权重排序的关键词召回 — **智能体核心调用** |
-| `top [N]` | 按有效权重排列的前 N 条（默认 10） |
+| `recall [关键词] [--type …] [--limit N] [--scenario …]` | 关键词+分数范围召回 — **智能体核心调用** |
+| `top [N] [--type …]` | 按有效权重排列的前 N 条（默认 10） |
 | `show` | 输出完整画像，按有效权重排序 |
 | `add <标签> <原因> [--score N]` | 手动添加或更新一条偏好（原因须加引号） |
 | `tag <标签> <关键词…>` | 为已有词条添加或替换关键词 |
@@ -173,6 +181,14 @@ cat conversation.md | aizo analyze
 # 智能体生成前召回偏好
 aizo top 5
 aizo recall "代码风格"
+
+# 场景化召回（coding 自动展开为约 10 个相关关键词）
+aizo recall --scenario coding --type preference,style,habit,taboo --limit 20
+
+# 仅按类型召回（无需关键词）
+aizo recall --type taboo                        # 所有硬性边界
+aizo recall code --type preference --limit 10   # 前 10 条编码偏好
+aizo recall code --type preference,habit --limit 20  # 多类型
 
 # 查看完整画像
 aizo show

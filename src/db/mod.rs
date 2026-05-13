@@ -362,24 +362,67 @@ impl Db {
         Ok(Self::sorted(rows))
     }
 
-    pub fn top(&self, n: usize) -> Result<Vec<Preference>> {
-        let mut rows = self.all()?;
+    pub fn top(&self, n: usize, score_ranges: &[(f64, f64)]) -> Result<Vec<Preference>> {
+        let mut rows = self.recall(&[], score_ranges, None, false)?;
         rows.truncate(n);
         Ok(rows)
     }
 
-    pub fn recall(&self, query: &str, touch: bool) -> Result<Vec<Preference>> {
+    /// Flexible recall: keyword search OR'd across queries, score filter OR'd across ranges.
+    ///
+    /// - `queries` empty  → no keyword filter (matches all entries)
+    /// - `score_ranges` empty → no score filter
+    /// - `limit` applied after sorting by effective_weight
+    pub fn recall(
+        &self,
+        queries: &[&str],
+        score_ranges: &[(f64, f64)],
+        limit: Option<usize>,
+        touch: bool,
+    ) -> Result<Vec<Preference>> {
         let cfg = self.get_decay_config()?;
-        let pattern = format!("%{}%", query.to_lowercase());
-        let sql = format!(
-            "{} WHERE LOWER(item) LIKE ?1 OR LOWER(reason) LIKE ?1 OR LOWER(keywords) LIKE ?1",
-            Self::SELECT
-        );
+
+        let mut where_clauses: Vec<String> = Vec::new();
+        let mut bind_vals: Vec<rusqlite::types::Value> = Vec::new();
+        let mut p = 1usize; // 1-based SQL param index
+
+        // Keyword filter: each query becomes one OR clause across all text fields
+        if !queries.is_empty() {
+            let kw_parts: Vec<String> = queries.iter().map(|q| {
+                let pattern = format!("%{}%", q.to_lowercase());
+                bind_vals.push(rusqlite::types::Value::Text(pattern));
+                let i = p; p += 1;
+                format!("(LOWER(item) LIKE ?{i} OR LOWER(reason) LIKE ?{i} OR LOWER(keywords) LIKE ?{i})")
+            }).collect();
+            where_clauses.push(format!("({})", kw_parts.join(" OR ")));
+        }
+
+        // Score range filter: multiple ranges are OR'd together
+        if !score_ranges.is_empty() {
+            let range_parts: Vec<String> = score_ranges.iter().map(|(min, max)| {
+                let i = p; p += 2;
+                bind_vals.push(rusqlite::types::Value::Real(*min));
+                bind_vals.push(rusqlite::types::Value::Real(*max));
+                format!("(base_score >= ?{i} AND base_score <= ?{})", i + 1)
+            }).collect();
+            where_clauses.push(format!("({})", range_parts.join(" OR ")));
+        }
+
+        let sql = if where_clauses.is_empty() {
+            Self::SELECT.to_string()
+        } else {
+            format!("{} WHERE {}", Self::SELECT, where_clauses.join(" AND "))
+        };
+
         let mut stmt = self.conn.prepare(&sql)?;
         let rows: Vec<Preference> = stmt
-            .query_map(params![pattern], |row| Self::hydrate(row, &cfg))?
+            .query_map(rusqlite::params_from_iter(bind_vals), |row| Self::hydrate(row, &cfg))?
             .collect::<rusqlite::Result<_>>()?;
-        let rows = Self::sorted(rows);
+
+        let mut rows = Self::sorted(rows);
+        if let Some(n) = limit {
+            rows.truncate(n);
+        }
         if touch {
             self.touch_ids(rows.iter().map(|p| p.id).collect())?;
         }

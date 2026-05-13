@@ -147,13 +147,17 @@ long explanation) on a specific topic.
 Run this *before* generating, not after:
 
 ```bash
-aizo recall "<primary topic keyword>"
+# scenario preset — expands to ~10 relevant keywords automatically
+aizo recall --scenario coding --type preference,style,habit,taboo --limit 20
+
+# or a targeted keyword + type
+aizo recall "<primary topic keyword>" --type preference,style,taboo
 ```
 
 Examples:
-- About to write code → `aizo recall code` then `aizo recall style`
-- About to write a document → `aizo recall writing` then `aizo recall format`
-- About to make a recommendation → `aizo recall preference`
+- About to write code → `aizo recall --scenario coding --type preference,style,habit,taboo --limit 20`
+- About to write a document → `aizo recall --scenario writing --type preference,style --limit 10`
+- Quick check for hard limits → `aizo recall --type taboo`
 
 If recall returns results, incorporate them as silent constraints — do not announce
 "according to your preferences…" unless relevant. Just apply them.
