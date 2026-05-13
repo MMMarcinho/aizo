@@ -52,20 +52,20 @@ batch analysis fills in the gaps and stabilises scores over time.
 ## Core design
 
 ```
-session transcript
+session transcript  (text, JSON, JSONL)
        │
        ▼
-  flash LLM (claude-haiku-4-5)
+  flash LLM (any OpenAI-compatible or Anthropic)
        │  semantic extraction
        ▼
-  structured entries  { category, item, base_score 0–10 }
-       │  smooth merge
+  structured entries  { item, base_score 0–10 }
+       │  smooth merge  (old×0.4 + new×0.6)
        ▼
   SQLite (~/.aizo/preferences.db)
        │
        ▼
   effective_weight = s · d(t)^α   (score-modulated decay)
-       │  keyword or top-N recall
+       │  keyword / type / scenario recall
        ▼
   agent reads profile → personalizes response
 ```
@@ -104,17 +104,7 @@ $$\boxed{w = s \cdot \left[\phi + (1-\phi) \cdot e^{-\lambda t}\right]^{\frac{10
 | 1  | 0.9 | Near-full | Weak aversion, fades quickly |
 | 0  | 1.0 | Full | $w = 0$ always — absolute zero |
 
-Entries are **never hard-deleted by decay** — they sink toward the floor and persist as weak long-term memory. Use `--type taboo` to surface them explicitly regardless of effective weight.
-
-### Scoring scale (0–10)
-
-| Score | Meaning |
-|---|---|
-| 0 | Absolute taboo / hard rejection |
-| 1–3 | Clear dislike / aversion |
-| 4–6 | Neutral tendency / weak pattern |
-| 7–9 | Clear preference |
-| 10 | Strong, consistent, high-priority love |
+Entries are **never hard-deleted by decay** — they sink toward the floor and persist as weak long-term memory. Use `aizo recall --type taboo` to surface hard limits regardless of effective weight.
 
 ### Score smoothing
 
@@ -128,18 +118,53 @@ new_base_score = old_base_score × 0.4 + incoming_score × 0.6
 
 ## Installation
 
-### From source (Rust ≥ 1.70)
-
 ```bash
+# Cargo (recommended)
+cargo install aizo
+
+# npm / npx
+npm install -g aizo
+npx aizo top 10
+
+# From source (Rust ≥ 1.70)
 git clone https://github.com/mmmarcinho/aizo
-cd aizo
-cargo build --release
+cd aizo && cargo build --release
 cp target/release/aizo /usr/local/bin/aizo
 ```
 
+### First-time setup
+
+Run the interactive wizard — it writes `~/.aizo/.env` and tests the connection:
+
 ```bash
-export ANTHROPIC_API_KEY=sk-ant-...   # required for 'analyze'
+aizo init
 ```
+
+Or set env vars manually:
+
+```bash
+# Anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
+
+# Any OpenAI-compatible / local model (Ollama, OpenRouter, DeepSeek, vLLM…)
+export AIZO_MODEL=qwen2.5:7b
+export AIZO_API_URL=http://localhost:11434/v1/chat/completions
+```
+
+### Configuration env vars
+
+| Variable | Default | Description |
+|---|---|---|
+| `AIZO_DB_PATH` | `~/.aizo/preferences.db` | SQLite database path |
+| `ANTHROPIC_API_KEY` | — | Anthropic API key (auto-detected) |
+| `AIZO_API_KEY` | — | API key for any provider |
+| `AIZO_API_URL` | provider default | LLM endpoint URL |
+| `AIZO_MODEL` | `claude-haiku-4-5` | Model name |
+| `AIZO_API_FORMAT` | auto | `anthropic` to force Anthropic wire format |
+| `AIZO_MAX_TOKENS` | `8192` | Max output tokens for LLM response |
+| `AIZO_AUTO_KEYWORDS` | `false` | `true` to auto-generate keywords via LLM |
+
+All vars can be set in `~/.aizo/.env` (user-wide) or `./.env` (per-project). Shell env always wins.
 
 ---
 
@@ -151,20 +176,35 @@ aizo [--db <path>] <COMMAND>
 
 | Command | Description |
 |---|---|
-| `analyze [file]` | Analyze session file or JSON export with flash LLM |
-| `recall [query] [--type …] [--limit N] [--scenario …]` | Keyword + score-range recall — **primary agent call** |
-| `top [N] [--type …]` | Top-N entries by effective weight (default 10) |
+| `init` | Interactive setup wizard — writes `~/.aizo/.env`, tests connection |
+| `analyze [file]` | Analyze session file or JSON/JSONL export with LLM |
+| `extract [file]` | Print extraction prompt to stdout (pipe to any LLM) |
+| `import` | Read `{"entries":[…]}` JSON from stdin and upsert entries |
+| `recall [query]` | Keyword + score-range recall — **primary agent call** |
+| `top [N]` | Top-N entries by effective weight (default 10) |
 | `show` | Full profile sorted by effective weight |
-| `add <item> <reason> [--score N]` | Manually add or update a preference |
+| `add <item> <reason>` | Manually add or update a preference |
 | `tag <item> <keywords…>` | Add or replace keywords on an existing entry |
 | `touch <item…>` | Reset decay clock without changing score |
 | `remove <item…>` | Hard-remove an entry |
 | `keywords` | List all stored keywords with entry counts |
 | `clear` | Wipe entire profile and session history |
-| `info` | DB path, score distribution, decay settings |
-| `config show` | Print decay configuration |
-| `config set-half-life <days>` | Set decay half-life |
-| `config set-floor <0.0–1.0>` | Set minimum decay floor |
+| `info` | DB path, score distribution, env config, decay settings |
+| `config show/set-half-life/set-floor` | Get or set decay parameters |
+
+**`recall` flags:**
+
+| Flag | Description |
+|---|---|
+| `--type/-t <types>` | Score-range filter, comma-separated: `preference`, `style`, `habit`, `aversion`, `taboo` |
+| `--limit/-l <N>` | Cap results after sorting by effective weight |
+| `--scenario <name>` | Expand to preset keyword list: `coding`, `writing`, `communication` |
+| `--no-touch` | Do not refresh `last_seen` for matched entries |
+| `--json` | Output raw JSON instead of human-readable text |
+
+**`top` / `show` / `recall` flags:** `--json` outputs raw JSON for agent consumption.
+
+**`top` flags:** `--type/-t` same score-range filter as recall.
 
 ### Score guide
 
@@ -273,9 +313,10 @@ CREATE TABLE decay_config (
 );
 
 CREATE TABLE sessions (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    analyzed_at TEXT    NOT NULL,
-    extracted   INTEGER NOT NULL DEFAULT 0
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    analyzed_at  TEXT    NOT NULL,
+    extracted    INTEGER NOT NULL DEFAULT 0,
+    content_hash TEXT    NOT NULL DEFAULT ''  -- FNV-1a hash for dedup
 );
 ```
 
@@ -291,12 +332,23 @@ import subprocess, json
 def top_preferences(n: int = 10) -> list[dict]:
     return json.loads(subprocess.check_output(["aizo", "top", str(n), "--json"]))
 
-def recall(query: str) -> list[dict]:
-    return json.loads(subprocess.check_output(["aizo", "recall", query, "--json"]))
+def recall(query: str, types: str = "preference,style,habit,taboo") -> list[dict]:
+    return json.loads(subprocess.check_output(
+        ["aizo", "recall", query, "--type", types, "--json"]
+    ))
+
+def recall_scenario(scenario: str) -> list[dict]:
+    return json.loads(subprocess.check_output(
+        ["aizo", "recall", "--scenario", scenario,
+         "--type", "preference,style,habit,taboo", "--limit", "20", "--json"]
+    ))
 
 # Inject into system prompt before generating
-prefs = top_preferences(10)
+prefs = top_preferences(20)
 system = f"User preferences:\n{json.dumps(prefs, indent=2)}\n\n{base_system}"
+
+# Before writing code, check coding preferences
+coding_prefs = recall_scenario("coding")
 ```
 
 Or configure `AIZO_DB_PATH` per-project to maintain separate profiles:
@@ -315,7 +367,7 @@ The SOP for how an agent should use aizo is defined as a skill file at
 (e.g. `.claude/skills/` for Claude Code) and any agent in that project will
 automatically follow the protocol.
 
-The skill defines six triggers:
+The skill defines seven triggers:
 
 | # | Trigger | aizo call | Timing |
 |---|---|---|---|
@@ -323,7 +375,7 @@ The skill defines six triggers:
 | 2 | User shows negative feedback | `aizo add … --score 1.5` then `aizo recall <topic>` | Sync, before corrected reply |
 | 3 | User praises something | `aizo add … --score 9.0` | Async, after reply sent |
 | 4 | User states an explicit rule | `aizo add … --score 0.5` or `--score 10` | Sync, immediate |
-| 5 | About to generate on topic X | `aizo recall <X>` | Sync, before generation |
+| 5 | About to generate on topic X | `aizo recall --scenario <X>` or `aizo recall <X> --type preference,style,taboo` | Sync, before generation |
 | 6 | Session ends | `aizo analyze <transcript>` | Async, background |
 | 7 | Daily cron job | Agent LLM scans logs → `aizo touch` confirmed items | Scheduled, background |
 
