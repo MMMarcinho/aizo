@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::scoring::{self, DecayConfig};
@@ -12,6 +13,7 @@ pub struct Preference {
     pub item: String,
     pub reason: String,
     pub keywords: Vec<String>,  // synonym/related-term tags for richer recall
+    pub scenarios: Vec<String>, // task scenarios this entry applies to
     pub base_score: f64,        // 0–10: 0 = hard limit, 10 = strong love
     pub source: String,         // "analysis" | "manual"
     pub added_at: String,
@@ -167,10 +169,63 @@ impl Db {
         }
 
         self.set_version(5)?;
+
+        if version < 6 {
+            self.conn.execute_batch("
+                CREATE TABLE IF NOT EXISTS preference_scenarios (
+                    preference_id INTEGER NOT NULL,
+                    scenario TEXT NOT NULL,
+                    PRIMARY KEY (preference_id, scenario),
+                    FOREIGN KEY (preference_id) REFERENCES preferences(id) ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_preference_scenarios_scenario
+                    ON preference_scenarios(scenario);
+            ")?;
+        }
+
+        self.set_version(6)?;
         Ok(())
     }
 
-    // ── Decay config ─────────────────────────────────────────────────────────
+    // ── Scenario backfill ──────────────────────────────────────────────────────
+
+    /// Backfill scenario associations from existing keyword data.
+    /// Idempotent: uses INSERT OR IGNORE so repeated calls are safe.
+    pub fn backfill_scenarios(&self, scenario_config: &HashMap<String, (String, Vec<String>)>) -> Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, keywords FROM preferences",
+        )?;
+        let rows: Vec<(i64, String)> = stmt.query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?.collect::<rusqlite::Result<_>>()?;
+
+        let mut insert = self.conn.prepare(
+            "INSERT OR IGNORE INTO preference_scenarios (preference_id, scenario) VALUES (?1, ?2)",
+        )?;
+
+        let mut total = 0usize;
+        for (id, keywords_raw) in &rows {
+            let kws: Vec<&str> = keywords_raw
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if kws.is_empty() {
+                continue;
+            }
+
+            for (scenario_name, (_, scenario_kws)) in scenario_config {
+                let hits = kws.iter().filter(|kw| scenario_kws.iter().any(|sk| sk == **kw)).count();
+                // High-confidence: at least 2 keyword matches, or the scenario name itself appears as a keyword
+                let direct = kws.iter().any(|kw| *kw == scenario_name.as_str());
+                if hits >= 2 || direct {
+                    let n = insert.execute(params![id, scenario_name])?;
+                    total += n as usize;
+                }
+            }
+        }
+        Ok(total)
+    }
 
     pub fn get_decay_config(&self) -> Result<DecayConfig> {
         self.conn
@@ -211,6 +266,7 @@ impl Db {
                 .filter(|s| !s.is_empty())
                 .map(String::from)
                 .collect(),
+            scenarios:         Vec::new(), // filled by load_scenarios_for
             base_score,
             source:            row.get(5)?,
             added_at:          row.get(6)?,
@@ -221,6 +277,41 @@ impl Db {
         })
     }
 
+    /// Batch-load scenarios for a set of preferences, populating their `.scenarios` fields.
+    fn load_scenarios_for(&self, prefs: &mut [Preference]) -> Result<()> {
+        if prefs.is_empty() {
+            return Ok(());
+        }
+        let placeholders: Vec<String> = prefs.iter().enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT preference_id, scenario FROM preference_scenarios WHERE preference_id IN ({}) ORDER BY preference_id, scenario",
+            placeholders.join(", ")
+        );
+        let ids: Vec<rusqlite::types::Value> = prefs.iter()
+            .map(|p| rusqlite::types::Value::Integer(p.id))
+            .collect();
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let pairs: Vec<(i64, String)> = stmt
+            .query_map(rusqlite::params_from_iter(ids), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+
+        // Group by preference_id
+        let mut map: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+        for (pid, scenario) in pairs {
+            map.entry(pid).or_default().push(scenario);
+        }
+
+        for pref in prefs.iter_mut() {
+            pref.scenarios = map.remove(&pref.id).unwrap_or_default();
+        }
+        Ok(())
+    }
+
     // ── Writes ────────────────────────────────────────────────────────────────
 
     /// Upsert with score smoothing (new = old×0.4 + incoming×0.6) and last_seen refresh.
@@ -229,6 +320,7 @@ impl Db {
         item: &str,
         reason: &str,
         keywords: &[String],
+        scenarios: &[String],
         base_score: f64,
         source: &str,
     ) -> Result<()> {
@@ -246,6 +338,26 @@ impl Db {
                 last_seen  = excluded.last_seen",
             params![item, reason, kw, base_score, source, now],
         )?;
+
+        // Get the row id (new or existing) to write scenario associations
+        let pref_id: i64 = self.conn.query_row(
+            "SELECT id FROM preferences WHERE LOWER(item) = LOWER(?1)",
+            params![item],
+            |r| r.get(0),
+        )?;
+
+        // Replace scenarios: delete old, insert new
+        self.conn.execute(
+            "DELETE FROM preference_scenarios WHERE preference_id = ?1",
+            params![pref_id],
+        )?;
+        let mut stmt = self.conn.prepare(
+            "INSERT OR IGNORE INTO preference_scenarios (preference_id, scenario) VALUES (?1, ?2)",
+        )?;
+        for s in scenarios {
+            stmt.execute(params![pref_id, s])?;
+        }
+
         Ok(())
     }
 
@@ -290,14 +402,81 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// Replace the keywords on an existing entry. Returns true if the entry was found.
-    pub fn tag(&self, item: &str, keywords: &[String]) -> Result<bool> {
-        let kw = keywords.iter().map(|k| k.to_lowercase()).collect::<Vec<_>>().join(", ");
-        let n = self.conn.execute(
-            "UPDATE preferences SET keywords = ?1 WHERE LOWER(item) = LOWER(?2)",
-            params![kw, item],
+    /// Replace the keywords (and optionally scenarios) on an existing entry.
+    /// Returns true if the entry was found.
+    pub fn tag(&self, item: &str, keywords: Option<&[String]>, scenarios: Option<&[String]>) -> Result<bool> {
+        // Get the pref id first
+        let pref_id: Option<i64> = self.conn.query_row(
+            "SELECT id FROM preferences WHERE LOWER(item) = LOWER(?1)",
+            params![item],
+            |r| r.get(0),
+        ).ok();
+
+        let Some(pref_id) = pref_id else {
+            return Ok(false);
+        };
+
+        if let Some(kws) = keywords {
+            let kw = kws.iter().map(|k| k.to_lowercase()).collect::<Vec<_>>().join(", ");
+            self.conn.execute(
+                "UPDATE preferences SET keywords = ?1 WHERE id = ?2",
+                params![kw, pref_id],
+            )?;
+        }
+
+        if let Some(scens) = scenarios {
+            self.conn.execute(
+                "DELETE FROM preference_scenarios WHERE preference_id = ?1",
+                params![pref_id],
+            )?;
+            let mut stmt = self.conn.prepare(
+                "INSERT OR IGNORE INTO preference_scenarios (preference_id, scenario) VALUES (?1, ?2)",
+            )?;
+            for s in scens {
+                stmt.execute(params![pref_id, s])?;
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// Return all scenarios with stats.
+    pub fn all_scenarios(
+        &self,
+        config: &std::collections::HashMap<String, (String, Vec<String>)>,
+    ) -> Result<Vec<(String, ScenarioStats)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT scenario, COUNT(*) FROM preference_scenarios GROUP BY scenario ORDER BY scenario",
         )?;
-        Ok(n > 0)
+        let counts: std::collections::HashMap<String, usize> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut result: Vec<(String, ScenarioStats)> = config
+            .iter()
+            .map(|(name, (desc, kws))| {
+                let entries = counts.get(name).copied().unwrap_or(0);
+                (name.clone(), ScenarioStats {
+                    entries,
+                    keywords: kws.len(),
+                    description: desc.clone(),
+                })
+            })
+            .collect();
+
+        // Add any scenarios in DB but not in config
+        for (name, entries) in &counts {
+            if !config.contains_key(name) {
+                result.push((name.clone(), ScenarioStats {
+                    entries: *entries,
+                    keywords: 0,
+                    description: String::new(),
+                }));
+            }
+        }
+
+        result.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(result)
     }
 
     /// Return all keywords with their entry counts.
@@ -356,14 +535,15 @@ impl Db {
     pub fn all(&self) -> Result<Vec<Preference>> {
         let cfg = self.get_decay_config()?;
         let mut stmt = self.conn.prepare(Self::SELECT)?;
-        let rows: Vec<Preference> = stmt
+        let mut rows: Vec<Preference> = stmt
             .query_map([], |row| Self::hydrate(row, &cfg))?
             .collect::<rusqlite::Result<_>>()?;
+        self.load_scenarios_for(&mut rows)?;
         Ok(Self::sorted(rows))
     }
 
     pub fn top(&self, n: usize, score_ranges: &[(f64, f64)]) -> Result<Vec<Preference>> {
-        let mut rows = self.recall(&[], score_ranges, None, false)?;
+        let mut rows = self.recall(&[], score_ranges, None, None, false)?;
         rows.truncate(n);
         Ok(rows)
     }
@@ -372,11 +552,13 @@ impl Db {
     ///
     /// - `queries` empty  → no keyword filter (matches all entries)
     /// - `score_ranges` empty → no score filter
+    /// - `scenario` → JOIN preference_scenarios to filter by scenario tag
     /// - `limit` applied after sorting by effective_weight
     pub fn recall(
         &self,
         queries: &[&str],
         score_ranges: &[(f64, f64)],
+        scenario: Option<&str>,
         limit: Option<usize>,
         touch: bool,
     ) -> Result<Vec<Preference>> {
@@ -384,7 +566,16 @@ impl Db {
 
         let mut where_clauses: Vec<String> = Vec::new();
         let mut bind_vals: Vec<rusqlite::types::Value> = Vec::new();
+        let mut joins: Vec<String> = Vec::new();
         let mut p = 1usize; // 1-based SQL param index
+
+        // Scenario filter: JOIN preference_scenarios
+        if let Some(s) = scenario {
+            joins.push("JOIN preference_scenarios ps ON preferences.id = ps.preference_id".into());
+            bind_vals.push(rusqlite::types::Value::Text(s.to_string()));
+            where_clauses.push(format!("ps.scenario = ?{}", p));
+            p += 1;
+        }
 
         // Keyword filter: each query becomes one OR clause across all text fields
         if !queries.is_empty() {
@@ -408,16 +599,26 @@ impl Db {
             where_clauses.push(format!("({})", range_parts.join(" OR ")));
         }
 
-        let sql = if where_clauses.is_empty() {
+        let sql = if where_clauses.is_empty() && joins.is_empty() {
             Self::SELECT.to_string()
-        } else {
+        } else if joins.is_empty() {
             format!("{} WHERE {}", Self::SELECT, where_clauses.join(" AND "))
+        } else {
+            let joins_str = joins.join(" ");
+            let where_str = if where_clauses.is_empty() {
+                String::new()
+            } else {
+                format!(" WHERE {}", where_clauses.join(" AND "))
+            };
+            format!("{} {} {}", Self::SELECT, joins_str, where_str)
         };
 
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows: Vec<Preference> = stmt
+        let mut rows: Vec<Preference> = stmt
             .query_map(rusqlite::params_from_iter(bind_vals), |row| Self::hydrate(row, &cfg))?
             .collect::<rusqlite::Result<_>>()?;
+
+        self.load_scenarios_for(&mut rows)?;
 
         let mut rows = Self::sorted(rows);
         if let Some(n) = limit {
@@ -448,6 +649,13 @@ pub struct Stats {
     pub mid: usize,       // score 4–6: neutral habits
     pub low: usize,       // score ≤ 3: dislikes / limits
     pub sessions: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScenarioStats {
+    pub entries: usize,
+    pub keywords: usize,
+    pub description: String,
 }
 
 impl Stats {

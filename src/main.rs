@@ -6,6 +6,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use db::{Db, Preference};
 use dirs::home_dir;
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
@@ -50,18 +52,21 @@ enum Command {
 
     /// Recall preferences matching a keyword, sorted by effective weight  [primary agent use]
     ///
-    /// --type maps to score ranges: preference(≥7), style(≥6.5), habit(4–7), aversion(1.5–4), taboo(≤1.5)
-    /// --scenario expands to a preset keyword list: coding, writing, communication
+    /// --scenario pulls entries explicitly tagged with a scenario; results are
+    /// also expanded with the scenario's configured keywords for broader coverage.
     Recall {
         /// Keyword matched against item, reason, AND synonyms; omit to filter by type/scenario only
         query: Option<String>,
-        /// Score-range filter (repeatable or comma-separated): preference, style, habit, aversion, taboo
+        /// Score-range filter by band name (repeatable or comma-separated): preference(≥7), style(≥6.5), habit(4–7), aversion(1.5–4), taboo(≤1.5)
+        #[arg(long = "score-band", value_delimiter = ',')]
+        score_bands: Vec<String>,
+        /// Deprecated alias for --score-band
         #[arg(long = "type", short = 't', value_delimiter = ',')]
         types: Vec<String>,
         /// Max results to return
         #[arg(long, short = 'l')]
         limit: Option<usize>,
-        /// Scenario preset — expands to relevant keyword queries: coding, writing, communication
+        /// Scenario — pulls entries tagged with this scenario + expanded keywords
         #[arg(long)]
         scenario: Option<String>,
         /// Do not refresh last_seen for matched entries
@@ -77,7 +82,10 @@ enum Command {
         /// Number of entries to show (default: 10)
         #[arg(default_value = "10")]
         n: usize,
-        /// Score-range filter (repeatable or comma-separated): preference, style, habit, aversion, taboo
+        /// Score-range filter by band name (repeatable or comma-separated): preference, style, habit, aversion, taboo
+        #[arg(long = "score-band", value_delimiter = ',')]
+        score_bands: Vec<String>,
+        /// Deprecated alias for --score-band
         #[arg(long = "type", short = 't', value_delimiter = ',')]
         types: Vec<String>,
         /// Output raw JSON instead of human-readable text
@@ -104,15 +112,21 @@ enum Command {
         /// Comma-separated synonym keywords for richer recall (e.g. concise,brevity,minimal)
         #[arg(long, value_delimiter = ',')]
         keywords: Vec<String>,
+        /// Comma-separated scenario names this entry applies to (e.g. coding,writing)
+        #[arg(long, value_delimiter = ',')]
+        scenarios: Vec<String>,
     },
 
-    /// Add or replace keywords on an existing entry without changing its score or reason
+    /// Add or replace keywords/scenarios on an existing entry
     Tag {
         /// Item label (case-insensitive)
         item: String,
         /// Keywords to set (space or comma-separated)
-        #[arg(trailing_var_arg = true, num_args = 1..)]
+        #[arg(long, value_delimiter = ',')]
         keywords: Vec<String>,
+        /// Comma-separated scenario names (e.g. coding,writing)
+        #[arg(long, value_delimiter = ',')]
+        scenarios: Vec<String>,
     },
 
     /// Refresh the decay clock of an existing entry without changing its score
@@ -138,6 +152,9 @@ enum Command {
         #[arg(long, default_value = "count")]
         sort: String,
     },
+
+    /// List all scenarios with entry counts and configured keywords
+    Scenarios,
 
     /// Interactive first-time setup: configure LLM provider and write ~/.aizo/.env
     Init,
@@ -339,8 +356,8 @@ fn score_label(score: f64) -> &'static str {
     if score >= 7.0 { "liked" } else if score <= 3.0 { "disliked" } else { "neutral" }
 }
 
-/// Map a type name to a (min, max) base_score range (inclusive).
-fn type_score_range(t: &str) -> Result<(f64, f64)> {
+/// Map a score-band name to a (min, max) base_score range (inclusive).
+fn parse_score_band(t: &str) -> Result<(f64, f64)> {
     match t.trim() {
         "preference" | "pref" | "like" | "love" => Ok((7.0, 10.0)),
         "style"                                  => Ok((6.5, 10.0)),
@@ -348,29 +365,108 @@ fn type_score_range(t: &str) -> Result<(f64, f64)> {
         "aversion" | "avers" | "dislike" | "hate"=> Ok((1.5, 4.0)),
         "taboo"  | "limit"  | "hard"             => Ok((0.0, 1.5)),
         other => anyhow::bail!(
-            "unknown type '{other}'. Use: preference, style, habit, aversion, taboo"
+            "unknown score band '{other}'. Use: preference, style, habit, aversion, taboo"
         ),
     }
 }
 
-/// Expand a scenario name into a list of keyword queries.
-fn scenario_queries(name: &str) -> Result<Vec<&'static str>> {
-    match name.trim() {
-        "coding" | "code" | "dev" | "development" => Ok(vec![
-            "code", "coding", "style", "naming", "format",
-            "test", "debug", "refactor", "review", "architecture",
-        ]),
-        "writing" | "docs" | "documentation" => Ok(vec![
-            "writing", "docs", "documentation", "format",
-            "tone", "style", "clarity", "length", "language",
-        ]),
-        "communication" | "chat" | "social" | "meeting" => Ok(vec![
-            "communication", "meeting", "message", "response",
-            "tone", "team", "email", "reply", "social",
-        ]),
-        other => anyhow::bail!(
-            "unknown scenario '{other}'. Built-in scenarios: coding, writing, communication"
-        ),
+// ── Scenario config ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Deserialize)]
+struct ScenarioDef {
+    #[serde(default)]
+    description: String,
+    keywords: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ScenarioConfig {
+    scenarios: HashMap<String, ScenarioDef>,
+}
+
+/// Load ~/.aizo/scenarios.yaml, auto-initializing with built-in defaults if missing.
+fn load_scenario_config() -> Result<ScenarioConfig> {
+    let aizo_dir = home_dir()
+        .context("cannot determine home directory")?
+        .join(".aizo");
+    let path = aizo_dir.join("scenarios.yaml");
+
+    if !path.exists() {
+        let default_yaml = r#"# aizo scenario configuration — edit freely to add/remove scenarios and keywords.
+# Each scenario defines a set of keywords used for extended recall.
+scenarios:
+  coding:
+    description: "Coding, debugging, implementation, repo changes"
+    keywords:
+      - coding
+      - codex
+      - repo
+      - test
+      - verification
+      - tnpm
+
+  writing:
+    description: "Docs, system design, plans, summaries"
+    keywords:
+      - writing
+      - document
+      - plan
+      - structure
+      - concise
+
+  communication:
+    description: "Reply tone, language, brevity, user-facing communication"
+    keywords:
+      - communication
+      - chinese
+      - concise
+      - tone
+      - kawaii
+
+  biz-analyze:
+    description: "Product docs, PRD, requirements, business and user analysis"
+    keywords:
+      - biz-analyze
+      - product
+      - business
+      - requirement
+      - prd
+      - user-journey
+      - metric
+      - strategy
+"#;
+        std::fs::create_dir_all(&aizo_dir)?;
+        std::fs::write(&path, default_yaml)?;
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    let config: ScenarioConfig = serde_yaml::from_str(&content)
+        .with_context(|| format!("parsing {}", path.display()))?;
+
+    for name in config.scenarios.keys() {
+        if config.scenarios[name].keywords.is_empty() {
+            anyhow::bail!("scenario '{name}' has no keywords in {path:?}");
+        }
+    }
+
+    Ok(config)
+}
+
+/// Resolve a scenario name (with aliases) to the canonical name in config.
+fn resolve_scenario<'a>(name: &'a str, config: &'a ScenarioConfig) -> Option<&'a str> {
+    let name = name.trim();
+    // Direct match
+    if config.scenarios.contains_key(name) {
+        return Some(name);
+    }
+    // Aliases
+    match name {
+        "code" | "dev" | "development" if config.scenarios.contains_key("coding") => Some("coding"),
+        "docs" | "documentation" if config.scenarios.contains_key("writing") => Some("writing"),
+        "chat" | "social" | "meeting" if config.scenarios.contains_key("communication") => Some("communication"),
+        "biz" | "business" | "product" if config.scenarios.contains_key("biz-analyze") => Some("biz-analyze"),
+        _ => None,
     }
 }
 
@@ -392,7 +488,11 @@ fn print_entries(entries: &[Preference], json: bool) {
     println!();
 
     for e in entries {
-        println!("  {:<28}  {:>4.1}   {}", e.item, e.effective_weight, e.reason);
+        if e.scenarios.is_empty() {
+            println!("  {:<28}  {:>4.1}   {}", e.item, e.effective_weight, e.reason);
+        } else {
+            println!("  {:<28}  {:>4.1}   {}  [{}]", e.item, e.effective_weight, e.reason, e.scenarios.join(", "));
+        }
     }
 }
 
@@ -572,6 +672,20 @@ fn main() -> Result<()> {
     let db_path = cli.db.unwrap_or_else(default_db_path);
     let db = Db::open(&db_path)?;
 
+    // Backfill scenario associations from existing keywords (idempotent)
+    {
+        if let Ok(sc_config) = load_scenario_config() {
+            let config_map: HashMap<String, (String, Vec<String>)> = sc_config.scenarios.iter()
+                .map(|(k, v)| (k.clone(), (v.description.clone(), v.keywords.clone())))
+                .collect();
+            match db.backfill_scenarios(&config_map) {
+                Ok(n) if n > 0 => eprintln!("Backfilled {n} scenario associations from existing keywords."),
+                Err(e) => eprintln!("Note: scenario backfill skipped ({e})"),
+                _ => {}
+            }
+        }
+    }
+
     match cli.command {
         Command::Keywords { sort } => {
             let mut kws = db.all_keywords()?;
@@ -622,6 +736,24 @@ fn main() -> Result<()> {
             }
         }
 
+        Command::Scenarios => {
+            let config = load_scenario_config()?;
+            let config_map: HashMap<String, (String, Vec<String>)> = config.scenarios.iter()
+                .map(|(k, v)| (k.clone(), (v.description.clone(), v.keywords.clone())))
+                .collect();
+            let scenarios = db.all_scenarios(&config_map)?;
+            if scenarios.is_empty() {
+                println!("No scenarios configured.");
+            } else {
+                println!("  {:<20}  {:>7}  {:>8}  {}", "scenario", "entries", "keywords", "description");
+                println!("  {}", "─".repeat(80));
+                for (name, stats) in &scenarios {
+                    println!("  {:<20}  {:>7}  {:>8}  {}",
+                        name, stats.entries, stats.keywords, stats.description);
+                }
+            }
+        }
+
         Command::Init => {
             cmd_init(&db_path)?;
         }
@@ -642,7 +774,7 @@ fn main() -> Result<()> {
             let result = analyzer::analyze(&text, existing_profile.as_deref(), taxonomy.as_deref())?;
 
             for e in &result.entries {
-                db.upsert(&e.item, &e.reason, &e.keywords, e.base_score, "analysis")?;
+                db.upsert(&e.item, &e.reason, &e.keywords, &[], e.base_score, "analysis")?;
             }
             db.log_session(result.entries.len(), &hash)?;
             print_analyze_summary(&result.entries);
@@ -660,30 +792,64 @@ fn main() -> Result<()> {
             std::io::stdin().read_to_string(&mut buf)?;
             let result = analyzer::parse_result(&buf)?;
             for e in &result.entries {
-                db.upsert(&e.item, &e.reason, &e.keywords, e.base_score, "analysis")?;
+                db.upsert(&e.item, &e.reason, &e.keywords, &[], e.base_score, "analysis")?;
             }
             db.log_session(result.entries.len(), "")?;
             print_analyze_summary(&result.entries);
         }
 
-        Command::Recall { query, types, limit, scenario, no_touch, json } => {
-            // Build keyword query list: scenario expansion + optional explicit query
-            let scenario_qs: Vec<&'static str> = match scenario.as_deref() {
-                Some(s) => scenario_queries(s)?,
-                None    => vec![],
-            };
-            let explicit: Vec<&str> = query.as_deref().map(|q| vec![q]).unwrap_or_default();
-            let all_queries: Vec<&str> = scenario_qs.iter().copied().chain(explicit).collect();
-
-            // Parse type → score ranges
-            let ranges: Vec<(f64, f64)> = types.iter()
-                .map(|t| type_score_range(t))
+        Command::Recall { query, score_bands, types, limit, scenario, no_touch, json } => {
+            // Merge --score-band and deprecated --type
+            let mut bands = score_bands;
+            if bands.is_empty() { bands = types; }
+            let ranges: Vec<(f64, f64)> = bands.iter()
+                .map(|t| parse_score_band(t))
                 .collect::<Result<_>>()?;
 
-            let prefs = db.recall(&all_queries, &ranges, limit, !no_touch)?;
+            let prefs = if let Some(s) = scenario.as_deref() {
+                // Scenario-based recall: exact match + keyword expansion
+                let config = load_scenario_config()?;
+                let canonical = resolve_scenario(s, &config)
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| s.to_string());
+
+                // 1. Exact scenario matches via JOIN
+                let mut exact = db.recall(&[], &ranges, Some(&canonical), None, !no_touch)?;
+
+                // 2. Keyword expansion from scenario config
+                let mut expanded = if let Some(def) = config.scenarios.get(&canonical) {
+                    let kw_queries: Vec<&str> = def.keywords.iter().map(String::as_str).collect();
+                    db.recall(&kw_queries, &ranges, None, None, false)?
+                } else {
+                    vec![]
+                };
+
+                // 3. Merge and dedupe by id
+                let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+                let mut merged = Vec::new();
+                for p in exact.drain(..).chain(expanded.drain(..)) {
+                    if seen.insert(p.id) {
+                        merged.push(p);
+                    }
+                }
+                // Re-sort by effective_weight
+                merged.sort_by(|a, b| b.effective_weight.partial_cmp(&a.effective_weight).unwrap());
+                if let Some(n) = limit { merged.truncate(n); }
+                if !no_touch {
+                    for p in &merged {
+                        let _ = db.touch(&p.item);
+                    }
+                }
+                merged
+            } else {
+                // Plain keyword / score-band recall
+                let queries: Vec<&str> = query.as_deref().map(|q| vec![q]).unwrap_or_default();
+                db.recall(&queries, &ranges, None, limit, !no_touch)?
+            };
+
             if prefs.is_empty() {
-                let scope = if types.is_empty() { String::new() }
-                            else { format!(" [{}]", types.join(", ")) };
+                let scope = if bands.is_empty() { String::new() }
+                            else { format!(" [{}]", bands.join(", ")) };
                 let what  = query.as_deref().unwrap_or(scenario.as_deref().unwrap_or("*"));
                 println!("No preferences matched \"{what}\"{scope}.");
             } else {
@@ -691,9 +857,11 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Top { n, types, json } => {
-            let ranges: Vec<(f64, f64)> = types.iter()
-                .map(|t| type_score_range(t))
+        Command::Top { n, score_bands, types, json } => {
+            let mut bands = score_bands;
+            if bands.is_empty() { bands = types; }
+            let ranges: Vec<(f64, f64)> = bands.iter()
+                .map(|t| parse_score_band(t))
                 .collect::<Result<_>>()?;
             let prefs = db.top(n, &ranges)?;
             if prefs.is_empty() {
@@ -712,35 +880,46 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Add { item, reason, score, keywords } => {
+        Command::Add { item, reason, score, keywords, scenarios } => {
             let base_score = match score {
                 Some(s) if (0.0..=10.0).contains(&s) => s,
                 Some(s) => anyhow::bail!("--score must be between 0.0 and 10.0, got {s}"),
                 None => 9.0,
             };
             let kws: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
-            db.upsert(&item, &reason, &kws, base_score, "manual")?;
+            let scens: Vec<String> = scenarios.iter().map(|s| s.to_lowercase()).collect();
+            db.upsert(&item, &reason, &kws, &scens, base_score, "manual")?;
             let label = score_label(base_score);
-            if kws.is_empty() {
+            let mut extras = Vec::new();
+            if !kws.is_empty() { extras.push(format!("keywords: {}", kws.join(", "))); }
+            if !scens.is_empty() { extras.push(format!("scenarios: {}", scens.join(", "))); }
+            if extras.is_empty() {
                 println!("Added [{label}]: \"{item}\" (score {base_score:.1})");
             } else {
-                println!("Added [{label}]: \"{item}\" (score {base_score:.1})  keywords: {}", kws.join(", "));
+                println!("Added [{label}]: \"{item}\" (score {base_score:.1})  {}", extras.join("  "));
             }
         }
 
-        Command::Tag { item, keywords } => {
-            if keywords.is_empty() {
-                anyhow::bail!("usage: aizo tag <item> <keyword>…");
+        Command::Tag { item, keywords, scenarios } => {
+            if keywords.is_empty() && scenarios.is_empty() {
+                anyhow::bail!("usage: aizo tag --keywords <kw> --scenarios <scenario> <item>");
             }
-            let kws: Vec<String> = keywords
-                .iter()
-                .flat_map(|k| k.split(','))
-                .map(|k| k.trim().to_lowercase())
-                .filter(|k| !k.is_empty())
-                .collect();
-            let found = db.tag(&item, &kws)?;
+            let kws: Option<Vec<String>> = if keywords.is_empty() {
+                None
+            } else {
+                Some(keywords.iter().map(|k| k.to_lowercase()).collect())
+            };
+            let scens: Option<Vec<String>> = if scenarios.is_empty() {
+                None
+            } else {
+                Some(scenarios.iter().map(|s| s.to_lowercase()).collect())
+            };
+            let found = db.tag(&item, kws.as_deref(), scens.as_deref())?;
             if found {
-                println!("Tagged \"{item}\"  keywords: {}", kws.join(", "));
+                let mut parts = Vec::new();
+                if let Some(ref k) = kws { parts.push(format!("keywords: {}", k.join(", "))); }
+                if let Some(ref s) = scens { parts.push(format!("scenarios: {}", s.join(", "))); }
+                println!("Tagged \"{item}\"  {}", parts.join("  "));
             } else {
                 println!("Not found: \"{item}\"");
             }
