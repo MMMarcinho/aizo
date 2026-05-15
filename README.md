@@ -10,62 +10,58 @@ It mimics human cognitive memory: rather than storing full conversation transcri
 
 ## How it fits together
 
-aizo is designed for two complementary usage loops:
+aizo is designed around two complementary patterns:
 
 ```
 ╔══════════════════════════════════════════════════════════════════════╗
 ║  1. In-session  (reactive — detects specific emotions in real time)  ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-   user ──► Claude Code ─────── aizo add ──────────────────┐
-                                                           ▼
-                             CLAUDE.md ◄── contributes ── local SQLite
-                                                      (user preference)
+   user ──► agent ─────── aizo add ──────────────────┐
+                                                     ▼
+                       CLAUDE.md ◄── contributes ── local SQLite
+                                                (user preference)
 
 
 ╔══════════════════════════════════════════════════════════════════════╗
-║  2. Background  (cron task — batch-analyzes accumulated sessions)    ║
+║  2. Just-in-time recall  (on-demand — pulls relevant prefs per task) ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-   user ──► openclaw ──► sessions ─── aizo analyze ─────────┐
-                                                            ▼
-   USER.md, SOUL.md, IDENTITY.md … ◄── contributes ── local SQLite
-                                                      (user preference)
+   agent gets task ──► aizo recall --scenario coding ──► session context
+                                                              │
+                                                              ▼
+                                                  generate with preferences
 ```
 
 **Loop 1 — In-session:** the agent detects a strong preference signal mid-conversation
-(praise, complaint, explicit rule) and calls `aizo add` immediately. The updated SQLite
-profile is then injected into `CLAUDE.md` (or equivalent context file) so the next
-session starts with the latest understanding of the user.
+(praise, complaint, explicit rule) and calls `aizo add` immediately. Key preferences
+that should persist across all sessions are written into `CLAUDE.md` or `MEMORY.md`.
 
-**Loop 2 — Background:** other agents (openclaw, etc.) accumulate session transcripts
-over time. A scheduled cron job runs `aizo analyze` to extract implicit preferences the
-reactive loop may have missed. The enriched profile is then written into richer identity
-files — `USER.md`, `SOUL.md`, `IDENTITY.md` — that build a persistent, evolving
-picture of the user across all agents and tools.
+**Loop 2 — Just-in-time recall:** not all preferences belong in persistent context files.
+The agent classifies each incoming task into a scenario, calls `aizo recall --scenario <X>`,
+and injects only the relevant preferences into the current session context. This keeps
+the agent's base context lean while giving it access to the full preference profile —
+just like human working memory.
 
-The two loops reinforce each other: reactive writes give immediate recall accuracy;
-batch analysis fills in the gaps and stabilises scores over time.
+For batch analysis of historical sessions to discover new preferences, see SOP 6 in
+`skills/aizo-sop.md` — this is a skill-level concern, not a built-in aizo command.
 
 ---
 
 ## Core design
 
 ```
-session transcript  (text, JSON, JSONL)
+agent observation  (praise, complaint, rule, habit)
        │
        ▼
-  flash LLM (any OpenAI-compatible or Anthropic)
-       │  semantic extraction
-       ▼
-  structured entries  { item, base_score 0–10 }
+  aizo add  { item, base_score 0–10, keywords, scenarios }
        │  smooth merge  (old×0.4 + new×0.6)
        ▼
   SQLite (~/.aizo/preferences.db)
        │
        ▼
   effective_weight = s · d(t)^α   (score-modulated decay)
-       │  keyword / type / scenario recall
+       │  keyword / score-band / scenario recall
        ▼
   agent reads profile → personalizes response
 ```
@@ -132,39 +128,18 @@ cd aizo && cargo build --release
 cp target/release/aizo /usr/local/bin/aizo
 ```
 
-### First-time setup
+### Configuration
 
-Run the interactive wizard — it writes `~/.aizo/.env` and tests the connection:
-
-```bash
-aizo init
-```
-
-Or set env vars manually:
+Set env vars in `~/.aizo/.env` (user-wide) or `./.env` (per-project). Shell env always wins.
 
 ```bash
-# Anthropic
-export ANTHROPIC_API_KEY=sk-ant-...
-
-# Any OpenAI-compatible / local model (Ollama, OpenRouter, DeepSeek, vLLM…)
-export AIZO_MODEL=qwen2.5:7b
-export AIZO_API_URL=http://localhost:11434/v1/chat/completions
+# Only AIZO_DB_PATH is needed for basic use (add/recall/top/show)
+export AIZO_DB_PATH=~/.aizo/preferences.db
 ```
-
-### Configuration env vars
 
 | Variable | Default | Description |
 |---|---|---|
 | `AIZO_DB_PATH` | `~/.aizo/preferences.db` | SQLite database path |
-| `ANTHROPIC_API_KEY` | — | Anthropic API key (auto-detected) |
-| `AIZO_API_KEY` | — | API key for any provider |
-| `AIZO_API_URL` | provider default | LLM endpoint URL |
-| `AIZO_MODEL` | `claude-haiku-4-5` | Model name |
-| `AIZO_API_FORMAT` | auto | `anthropic` to force Anthropic wire format |
-| `AIZO_MAX_TOKENS` | `8192` | Max output tokens for LLM response |
-| `AIZO_AUTO_KEYWORDS` | `false` | `true` to auto-generate keywords via LLM |
-
-All vars can be set in `~/.aizo/.env` (user-wide) or `./.env` (per-project). Shell env always wins.
 
 ---
 
@@ -176,19 +151,16 @@ aizo [--db <path>] <COMMAND>
 
 | Command | Description |
 |---|---|
-| `init` | Interactive setup wizard — writes `~/.aizo/.env`, tests connection |
-| `analyze [file]` | Analyze session file or JSON/JSONL export with LLM |
-| `extract [file]` | Print extraction prompt to stdout (pipe to any LLM) |
-| `import` | Read `{"entries":[…]}` JSON from stdin and upsert entries |
 | `recall [query]` | Keyword + score-range recall — **primary agent call** |
-| `top [N]` | Top-N entries by effective weight (default 10) |
-| `show` | Full profile sorted by effective weight |
+| `top [N]` | Top-N entries by effective weight (read-only, default 10) |
+| `show` | Full profile sorted by effective weight (read-only) |
 | `add <item> <reason>` | Manually add or update a preference |
-| `tag <item> <keywords…>` | Add or replace keywords on an existing entry |
+| `update <item>` | Update fields on an existing entry (item, reason, score, keywords, scenarios) |
 | `touch <item…>` | Reset decay clock without changing score |
 | `remove <item…>` | Hard-remove an entry |
 | `keywords` | List all stored keywords with entry counts |
-| `clear` | Wipe entire profile and session history |
+| `scenarios` | List all scenarios with entry counts and configured keywords |
+| `clear` | Wipe entire preference profile |
 | `info` | DB path, score distribution, env config, decay settings |
 | `config show/set-half-life/set-floor` | Get or set decay parameters |
 
@@ -203,9 +175,9 @@ aizo [--db <path>] <COMMAND>
 | `--no-touch` | Do not refresh `last_seen` for matched entries |
 | `--json` | Output raw JSON instead of human-readable text |
 
-**`top` / `show` / `recall` flags:** `--json` outputs raw JSON for agent consumption.
+**`top` flags:** `--type/-t`, `--scenario`, `--json`. Read-only — never touches `last_seen`.
 
-**`top` flags:** `--type/-t` same score-range filter as recall.
+**`show` flags:** `--json` only. Read-only — never touches `last_seen`.
 
 ### Score guide
 
@@ -232,10 +204,6 @@ Use keywords (`--keywords` on add, or `aizo tag`) to add any taxonomy you want.
 ### Examples
 
 ```bash
-# Analyze a session log
-aizo analyze ./chat.txt
-cat conversation.md | aizo analyze
-
 # Agent recalls preferences before generating
 aizo top 5
 aizo recall "code style"
@@ -248,19 +216,22 @@ aizo recall --type taboo                        # all hard limits
 aizo recall code --type preference --limit 10   # top coding preferences
 aizo recall code --type preference,habit --limit 20  # multiple types
 
-# Inspect full profile
+# Custom minimum score threshold
+aizo recall --scenario coding --min-score 5.0 --limit 20
+
+# Inspect full profile or top-N
 aizo show
+aizo top 20 --scenario coding --json
 
 # Manual entries — score encodes sentiment
 aizo add "concise code"     "Always asks for shorter implementations"  --score 9.0
 aizo add "verbose comments" "Complained about over-documented code"    --score 1.5
 aizo add "emojis in output" "Explicitly said never use emojis"         --score 0.5
-aizo add "uses dark mode"   "Mentioned dark theme in every UI session" --score 5.0
-aizo add "terse naming"     "Consistently chose short variable names"  --score 8.0
+aizo add "uses dark mode"   "Mentioned dark theme in every UI session" --score 5.0 --scenarios coding
 
-# Add or manage keywords for richer recall
-aizo tag "concise code" brevity minimal short lean
-aizo tag "verbose comments" verbosity docs comments over-engineering
+# Update an existing entry
+aizo update "concise code" --score 8.5 --keywords brevity,minimal,short
+aizo update "verbose comments" --scenarios coding,writing
 
 # Tune decay (default: half-life 30d, floor 0.1)
 aizo config set-half-life 14
@@ -312,13 +283,6 @@ CREATE TABLE decay_config (
     half_life_days  REAL    NOT NULL DEFAULT 30.0,
     floor           REAL    NOT NULL DEFAULT 0.1
 );
-
-CREATE TABLE sessions (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    analyzed_at  TEXT    NOT NULL,
-    extracted    INTEGER NOT NULL DEFAULT 0,
-    content_hash TEXT    NOT NULL DEFAULT ''  -- FNV-1a hash for dedup
-);
 ```
 
 ---
@@ -330,26 +294,24 @@ Any agent can call aizo as a subprocess — no embedding, no vector index, no ru
 ```python
 import subprocess, json
 
+def recall_scenario(scenario: str, min_score: float = 3.0) -> list[dict]:
+    """Just-in-time recall for a specific task scenario."""
+    return json.loads(subprocess.check_output(
+        ["aizo", "recall", "--scenario", scenario,
+         "--type", "preference,style,habit,taboo",
+         "--min-score", str(min_score), "--limit", "20", "--json"]
+    ))
+
 def top_preferences(n: int = 10) -> list[dict]:
     return json.loads(subprocess.check_output(["aizo", "top", str(n), "--json"]))
 
-def recall(query: str, types: str = "preference,style,habit,taboo") -> list[dict]:
-    return json.loads(subprocess.check_output(
-        ["aizo", "recall", query, "--type", types, "--json"]
-    ))
-
-def recall_scenario(scenario: str) -> list[dict]:
-    return json.loads(subprocess.check_output(
-        ["aizo", "recall", "--scenario", scenario,
-         "--type", "preference,style,habit,taboo", "--limit", "20", "--json"]
-    ))
-
-# Inject into system prompt before generating
-prefs = top_preferences(20)
-system = f"User preferences:\n{json.dumps(prefs, indent=2)}\n\n{base_system}"
-
-# Before writing code, check coding preferences
+# Just-in-time: before coding, recall coding-specific preferences
 coding_prefs = recall_scenario("coding")
+# Inject into session context — don't write to disk
+context = f"[Coding preferences]\n{json.dumps(coding_prefs, indent=2)}"
+
+# Before writing a document, recall writing preferences
+writing_prefs = recall_scenario("writing")
 ```
 
 Or configure `AIZO_DB_PATH` per-project to maintain separate profiles:
@@ -426,12 +388,11 @@ The skill defines seven triggers:
 | 3 | User praises something | `aizo add … --score 9.0` | Async, after reply sent |
 | 4 | User states an explicit rule | `aizo add … --score 0.5` or `--score 10` | Sync, immediate |
 | 5 | About to generate on topic X | Classify task → `aizo recall --scenario <X> --min-score 3.0` → inject into context | Sync, before generation |
-| 6 | Session ends | `aizo analyze <transcript>` | Async, background |
+| 6 | Historical batch analysis | Agent LLM scans past sessions → `aizo add` new + `aizo touch` confirmed | Scheduled, background |
 | 7 | Daily cron job | Agent LLM scans logs → `aizo touch` confirmed items | Scheduled, background |
 
 **Key rules encoded in the skill:**
 - Taboos always win over preferences in conflicts
-- `analyze` is for full sessions, not single messages — it calls an LLM
 - Silence (`recall` returning nothing) means no data, not neutral preference
 - Never mention aizo to the user — it runs silently
 - Use scenario recall for just-in-time context; don't dump everything into CLAUDE.md

@@ -6,11 +6,11 @@ set as hard limits, with a time-decay mechanism so recent signals carry more wei
 
 ## How aizo fits into the agent ecosystem
 
-aizo operates in two complementary loops. Understand which loop you are in:
+aizo operates in two complementary patterns. Understand which you are in:
 
 ```
 ╔══════════════════════════════════════════════════════════════════════╗
-║  Loop 1 — In-session  (you are here during a live conversation)      ║
+║  Pattern 1 — In-session  (you are here during a live conversation)   ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
    user ──► agent (you) ──── aizo add ───────────────────┐
@@ -19,24 +19,25 @@ aizo operates in two complementary loops. Understand which loop you are in:
 
 
 ╔══════════════════════════════════════════════════════════════════════╗
-║  Loop 2 — Background  (cron job, runs outside live sessions)         ║
+║  Pattern 2 — Just-in-time recall  (on-demand per task)              ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
-   accumulated sessions ── aizo analyze ─────────────────┐
-                                                          ▼
-   USER.md, SOUL.md, IDENTITY.md … ◄── contributes ── local SQLite
+   agent gets task ──► aizo recall --scenario coding ──► session context
+                                                              │
+                                                              ▼
+                                                  generate with preferences
 ```
 
-**Loop 1 (SOPs 1–6):** you run live. Detect preference signals, write them with
-`aizo add`, recall before generating, and batch-analyze the session transcript at the end.
-The profile flows back into `CLAUDE.md` so the next session starts informed.
+**Pattern 1 (SOPs 1–4):** you run live. Detect preference signals, write them with
+`aizo add`. Key preferences that should persist across sessions flow into `CLAUDE.md`
+or `MEMORY.md`.
 
-**Loop 2 (SOP 7):** a scheduled cron job processes accumulated session transcripts with
-`aizo analyze`. The enriched profile is then used to maintain richer identity files
-(`USER.md`, `SOUL.md`, `IDENTITY.md`, etc.) that persist the user's evolving persona
-across all agents and tools.
+**Pattern 2 (SOP 5):** not all preferences belong in persistent context files. Use
+scenario-based recall to pull relevant preferences on demand. This keeps the base
+context lean — like human working memory.
 
-The SOPs below cover both loops. SOPs 1–6 are for live sessions; SOP 7 is for the cron job.
+**SOPs 6–7** cover periodic maintenance: batch analysis of historical sessions and
+decay-clock refresh. These run in the background, not during live conversations.
 
 TRIGGER: automatically apply this SOP at session start and on any of the events below.
 
@@ -238,43 +239,82 @@ When the user expresses a context-specific preference, tag it with the relevant 
 ```bash
 # This preference only applies to coding — tag it accordingly
 aizo add "no emojis in code" "Rejected emoji in a PR comment" --score 1.5
-aizo tag "no emojis in code" coding review
+aizo update "no emojis in code" --scenarios coding,review
 ```
 
 Now it surfaces when recalling `coding` or `review`, but not when recalling `writing`.
 
 ---
 
-## SOP 6 — End of session: batch analysis
+## SOP 6 — Historical batch analysis (skill-based, no aizo built-in)
 
-**Trigger:** the conversation is concluding (user says goodbye, task is complete,
-long silence, explicit sign-off).
+**Trigger:** scheduled background task (daily or weekly). Not a live session event.
 
-Collect the full session text and run:
+**Problem this solves:** over time, the user demonstrates new preferences that were never
+explicitly captured in real time. This SOP discovers those implicit preferences by having
+your LLM scan past session transcripts and extract new signals — then write them with
+`aizo add`. Existing confirmed preferences get their decay clocks reset via `aizo touch`.
 
+aizo no longer has a built-in `analyze` command. Instead, the agent uses its own LLM
+capability to perform this extraction. This gives you full control over the prompt and
+extraction style.
+
+**Steps:**
+
+1. Collect recent session transcripts (past day or week, depending on frequency).
+
+2. Load the current preference list:
 ```bash
-aizo analyze <session-file>
-# OR pipe from your session buffer:
-echo "<full session text>" | aizo analyze
+aizo show --json
 ```
 
-This captures implicit signals that were not obvious enough to trigger SOPs 2–4 in
-real time. It is async — run it after the session ends, not during.
+3. Ask your LLM with a prompt like:
+```
+Given this list of known user preferences:
+<paste aizo show output>
 
-Do not run this mid-session: the flash LLM extracts preferences from the whole arc
-of a conversation, and partial sessions produce noisy results.
+And these recent interaction sessions:
+<paste session transcripts>
+
+1. Identify any NEW preferences, aversions, habits, or hard limits that are NOT
+   already in the known list. For each, output a JSON object with:
+   {"item": "short label", "reason": "one sentence from the session", "base_score": 0.0-10.0}
+   Score guide: 0-1.5 = hard limit/taboo, 1.5-4 = aversion, 4-7 = habit, 7-10 = preference.
+
+2. Identify which EXISTING preferences were clearly demonstrated or confirmed.
+   Return ONLY a JSON array of item strings: ["item one", "item two", ...]
+   Only include items that were unambiguously present. Return [] if none.
+
+Return your response as:
+{"new": [...], "confirmed": ["item one", ...]}
+```
+
+4. For each new entry, call:
+```bash
+aizo add "<item>" "<reason>" --score <base_score>
+```
+
+5. For each confirmed item, call:
+```bash
+aizo touch "<item>"
+```
+
+6. That's it. New entries are created with source="manual", confirmed entries get their
+decay clocks reset. No LLM API calls from aizo itself — your LLM does the thinking.
+
+**Recommended frequency:** daily for active users, weekly for moderate use. More frequent
+runs improve decay accuracy but cost more in LLM tokens.
 
 ---
 
 ## SOP 7 — Daily cron scan: refresh confirmed memories
 
-**Trigger:** a scheduled cron job, not a live session event. Recommended frequency: once per day.
+**Trigger:** a scheduled cron job. Recommended frequency: once per day.
 
-**Problem this solves:** `analyze` only discovers *new* preferences. Existing memories whose
-`last_seen` is never refreshed will slowly decay — even if the user demonstrates them every day.
-The cron scan confirms which existing memories are still active and resets their decay clocks.
+This is a lighter version of SOP 6 — it only refreshes existing memories, without
+searching for new ones. Useful for daily maintenance between full batch analyses.
 
-**The agent's responsibility** (the CLI has no LLM — this logic runs on your side):
+**Steps:**
 
 1. Collect the past day's session transcripts or recent interaction logs.
 
@@ -308,19 +348,14 @@ aizo touch "<item>"
 0 0 * * * /path/to/scan-and-touch.sh
 ```
 
-Where `scan-and-touch.sh` is a script that:
-- Collects today's logs
-- Calls the LLM (via API or local model)
-- Pipes confirmed items into `aizo touch` calls
+**Key distinction:**
 
-**Key distinction from `analyze`:**
-
-| Command | Creates new entries | Updates scores | Resets `last_seen` |
+| SOP | Creates new entries | Updates scores | Resets `last_seen` |
 |---|---|---|---|
-| `aizo analyze` | Yes | Yes (smoothed) | Yes |
-| `aizo touch` | No | No | Yes |
+| SOP 6 (batch analysis) | Yes | No (new entries only) | Yes |
+| SOP 7 (cron scan) | No | No | Yes |
 
-Use `analyze` to **learn**. Use `touch` (via cron) to **remember**.
+Use SOP 6 to **learn** (weekly). Use SOP 7 to **remember** (daily).
 
 ---
 
@@ -330,7 +365,7 @@ When preferences conflict (e.g. recall returns both a preference and an aversion
 the same topic), apply this order:
 
 1. **Taboo** (score 0–1.5) — always wins, no exceptions
-2. **Explicit instruction** (source: manual, score 10) — overrides analysis
+2. **Explicit instruction** (score 10) — overrides inferred preferences
 3. **High effective weight** — higher `effective_weight` breaks ties
 4. **Recency** — if weights are close, `last_seen` breaks the tie
 
@@ -339,9 +374,9 @@ the same topic), apply this order:
 ## What NOT to do
 
 - Do not mention aizo to the user unless they ask. It runs silently.
-- Do not run `aizo analyze` on every single message — it calls an LLM and costs money.
-  Reserve it for substantial session text or explicit end-of-session.
 - Do not hard-code assumptions. If `aizo show` returns an empty profile, the user is
   new — start neutral, learn fast.
 - Do not confuse silence with preference. `aizo recall X` returning nothing means
   no data, not that X is neutral.
+- Do not dump every preference into CLAUDE.md. Use scenario recall (SOP 5) for
+  just-in-time context — only write truly global preferences to persistent files.

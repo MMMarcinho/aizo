@@ -88,15 +88,6 @@ impl Db {
             );
             INSERT OR IGNORE INTO decay_config (id, half_life_days, floor)
                 VALUES (1, 30.0, 0.1);
-
-            CREATE TABLE IF NOT EXISTS sessions (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                analyzed_at  TEXT    NOT NULL,
-                extracted    INTEGER NOT NULL DEFAULT 0,
-                content_hash TEXT    NOT NULL DEFAULT ''
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_hash
-                ON sessions(content_hash) WHERE content_hash != '';
         ")?;
 
         if version < 5 {
@@ -402,44 +393,6 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// Replace the keywords (and optionally scenarios) on an existing entry.
-    /// Returns true if the entry was found.
-    pub fn tag(&self, item: &str, keywords: Option<&[String]>, scenarios: Option<&[String]>) -> Result<bool> {
-        // Get the pref id first
-        let pref_id: Option<i64> = self.conn.query_row(
-            "SELECT id FROM preferences WHERE LOWER(item) = LOWER(?1)",
-            params![item],
-            |r| r.get(0),
-        ).ok();
-
-        let Some(pref_id) = pref_id else {
-            return Ok(false);
-        };
-
-        if let Some(kws) = keywords {
-            let kw = kws.iter().map(|k| k.to_lowercase()).collect::<Vec<_>>().join(", ");
-            self.conn.execute(
-                "UPDATE preferences SET keywords = ?1 WHERE id = ?2",
-                params![kw, pref_id],
-            )?;
-        }
-
-        if let Some(scens) = scenarios {
-            self.conn.execute(
-                "DELETE FROM preference_scenarios WHERE preference_id = ?1",
-                params![pref_id],
-            )?;
-            let mut stmt = self.conn.prepare(
-                "INSERT OR IGNORE INTO preference_scenarios (preference_id, scenario) VALUES (?1, ?2)",
-            )?;
-            for s in scens {
-                stmt.execute(params![pref_id, s])?;
-            }
-        }
-
-        Ok(true)
-    }
-
     /// Return all scenarios with stats.
     pub fn all_scenarios(
         &self,
@@ -498,30 +451,75 @@ impl Db {
 
     pub fn clear(&self) -> Result<()> {
         self.conn
-            .execute_batch("DELETE FROM preferences; DELETE FROM sessions;")?;
+            .execute_batch("DELETE FROM preferences;")?;
         Ok(())
     }
 
-    pub fn has_analyzed(&self, hash: &str) -> Result<bool> {
-        let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM sessions WHERE content_hash = ?1",
-            params![hash],
+    /// Update fields on an existing preference entry. Only Some/Non-empty fields are changed.
+    /// Returns true if the entry was found.
+    pub fn update(
+        &self,
+        item: &str,
+        new_item: Option<&str>,
+        reason: Option<&str>,
+        score: Option<f64>,
+        keywords: Option<&[String]>,
+        scenarios: Option<&[String]>,
+    ) -> Result<bool> {
+        let pref_id: Option<i64> = self.conn.query_row(
+            "SELECT id FROM preferences WHERE LOWER(item) = LOWER(?1)",
+            params![item],
             |r| r.get(0),
-        )?;
-        Ok(n > 0)
-    }
+        ).ok();
 
-    pub fn log_session(&self, extracted: usize, hash: &str) -> Result<()> {
-        let now = Utc::now().to_rfc3339();
-        self.conn.execute(
-            "INSERT OR IGNORE INTO sessions (analyzed_at, extracted, content_hash)
-             VALUES (?1, ?2, ?3)",
-            params![now, extracted as i64, hash],
-        )?;
-        Ok(())
-    }
+        let Some(pref_id) = pref_id else {
+            return Ok(false);
+        };
 
-    // ── Reads ─────────────────────────────────────────────────────────────────
+        if let Some(ni) = new_item {
+            self.conn.execute(
+                "UPDATE preferences SET item = ?1 WHERE id = ?2",
+                params![ni, pref_id],
+            )?;
+        }
+
+        if let Some(r) = reason {
+            self.conn.execute(
+                "UPDATE preferences SET reason = ?1 WHERE id = ?2",
+                params![r, pref_id],
+            )?;
+        }
+
+        if let Some(s) = score {
+            self.conn.execute(
+                "UPDATE preferences SET base_score = ?1 WHERE id = ?2",
+                params![s, pref_id],
+            )?;
+        }
+
+        if let Some(kws) = keywords {
+            let kw = kws.iter().map(|k| k.to_lowercase()).collect::<Vec<_>>().join(", ");
+            self.conn.execute(
+                "UPDATE preferences SET keywords = ?1 WHERE id = ?2",
+                params![kw, pref_id],
+            )?;
+        }
+
+        if let Some(scens) = scenarios {
+            self.conn.execute(
+                "DELETE FROM preference_scenarios WHERE preference_id = ?1",
+                params![pref_id],
+            )?;
+            let mut stmt = self.conn.prepare(
+                "INSERT OR IGNORE INTO preference_scenarios (preference_id, scenario) VALUES (?1, ?2)",
+            )?;
+            for s in scens {
+                stmt.execute(params![pref_id, s])?;
+            }
+        }
+
+        Ok(true)
+    }
 
     const SELECT: &'static str =
         "SELECT id, item, reason, keywords, base_score, source, added_at, last_seen
@@ -635,10 +633,9 @@ impl Db {
             self.conn.query_row(sql, [], |r| r.get(0))
         };
         Ok(Stats {
-            high:     count("SELECT COUNT(*) FROM preferences WHERE base_score >= 7.0")?,
-            mid:      count("SELECT COUNT(*) FROM preferences WHERE base_score > 3.0 AND base_score < 7.0")?,
-            low:      count("SELECT COUNT(*) FROM preferences WHERE base_score <= 3.0")?,
-            sessions: count("SELECT COUNT(*) FROM sessions")?,
+            high:   count("SELECT COUNT(*) FROM preferences WHERE base_score >= 7.0")?,
+            mid:    count("SELECT COUNT(*) FROM preferences WHERE base_score > 3.0 AND base_score < 7.0")?,
+            low:    count("SELECT COUNT(*) FROM preferences WHERE base_score <= 3.0")?,
         })
     }
 }
@@ -648,7 +645,6 @@ pub struct Stats {
     pub high: usize,      // score ≥ 7: strong likes
     pub mid: usize,       // score 4–6: neutral habits
     pub low: usize,       // score ≤ 3: dislikes / limits
-    pub sessions: usize,
 }
 
 #[derive(Debug, Serialize)]
