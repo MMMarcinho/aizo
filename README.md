@@ -198,7 +198,8 @@ aizo [--db <path>] <COMMAND>
 |---|---|
 | `--type/-t <types>` | Score-range filter, comma-separated: `preference`, `style`, `habit`, `aversion`, `taboo` |
 | `--limit/-l <N>` | Cap results after sorting by effective weight |
-| `--scenario <name>` | Expand to preset keyword list: `coding`, `writing`, `communication` |
+| `--scenario <name>` | Scenario-tagged recall + keyword expansion from `~/.aizo/scenarios.yaml` |
+| `--min-score <N>` | Minimum `base_score` threshold (0.0–10.0); clamps band lower bounds |
 | `--no-touch` | Do not refresh `last_seen` for matched entries |
 | `--json` | Output raw JSON instead of human-readable text |
 
@@ -358,6 +359,55 @@ export AIZO_DB_PATH=./project-prefs.db
 aizo show
 ```
 
+### Just-in-time scenario recall
+
+Not all preferences belong in persistent context files like `CLAUDE.md` or `MEMORY.md` —
+those files would grow unboundedly. Instead, use **scenario-based recall** to pull relevant
+preferences on demand, right when the agent receives a task:
+
+```
+agent receives task ──► classify into scenario ──► aizo recall --scenario <X>
+                                                          │
+                                                          ▼
+                                               inject results into session context
+                                                          │
+                                                          ▼
+                                               generate response with preferences applied
+```
+
+This keeps the agent's base context lean while giving it access to the full preference
+profile. The pattern works like human memory: you don't pre-load every preference into
+working memory — you recall the relevant ones when the situation calls for it.
+
+**Example flow (coding task):**
+
+```bash
+# Agent classifies the user's request as a coding task, then:
+aizo recall --scenario coding --type preference,style,habit,taboo --min-score 3.0 --limit 20 --json
+```
+
+**Example flow (writing task):**
+
+```bash
+# Agent classifies the user's request as a writing task, then:
+aizo recall --scenario writing --type preference,style,taboo --limit 15 --json
+```
+
+**Creating scenario-specific entries.** When the user expresses a preference that only
+applies to a certain context, tag it with that scenario so it surfaces only for relevant
+tasks:
+
+```bash
+aizo add "no emojis in code" "Rejected emoji in a PR comment" --score 1.5
+aizo tag "no emojis in code" coding review
+
+aizo add "use active voice" "Praised direct, active-voice writing" --score 8.5
+aizo tag "use active voice" writing
+```
+
+The agent then only sees "no emojis in code" when coding — not when writing casual messages.
+This scoped recall prevents preference leakage across unrelated task domains.
+
 ---
 
 ## Standard Operating Procedure (SOP)
@@ -375,7 +425,7 @@ The skill defines seven triggers:
 | 2 | User shows negative feedback | `aizo add … --score 1.5` then `aizo recall <topic>` | Sync, before corrected reply |
 | 3 | User praises something | `aizo add … --score 9.0` | Async, after reply sent |
 | 4 | User states an explicit rule | `aizo add … --score 0.5` or `--score 10` | Sync, immediate |
-| 5 | About to generate on topic X | `aizo recall --scenario <X>` or `aizo recall <X> --type preference,style,taboo` | Sync, before generation |
+| 5 | About to generate on topic X | Classify task → `aizo recall --scenario <X> --min-score 3.0` → inject into context | Sync, before generation |
 | 6 | Session ends | `aizo analyze <transcript>` | Async, background |
 | 7 | Daily cron job | Agent LLM scans logs → `aizo touch` confirmed items | Scheduled, background |
 
@@ -384,6 +434,7 @@ The skill defines seven triggers:
 - `analyze` is for full sessions, not single messages — it calls an LLM
 - Silence (`recall` returning nothing) means no data, not neutral preference
 - Never mention aizo to the user — it runs silently
+- Use scenario recall for just-in-time context; don't dump everything into CLAUDE.md
 
 ---
 

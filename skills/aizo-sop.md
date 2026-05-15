@@ -139,31 +139,109 @@ aizo add "<the rule>" "<their exact instruction, quoted>" --score 10.0
 
 ---
 
-## SOP 5 — Pre-generation topic recall
+## SOP 5 — Pre-generation topic recall (just-in-time scenario recall)
 
 **Trigger:** you are about to generate a substantial response (code, document, plan,
-long explanation) on a specific topic.
+long explanation) on a specific topic — OR you have just received a user instruction
+and are classifying it before acting.
+
+**Core idea:** not all preferences should be pre-loaded into `CLAUDE.md` or `MEMORY.md`.
+Those files would grow without bound. Instead, the full preference profile lives in
+aizo's database, and you pull in only what is relevant to the current task — just like
+human working memory.
+
+### Step 1 — Classify the task into a scenario
+
+When a user gives you a task, first determine which scenario it belongs to. Common
+scenarios and their typical keywords (defined in `~/.aizo/scenarios.yaml`):
+
+| Scenario | When to use | Typical keywords |
+|---|---|---|
+| `coding` | Writing, reviewing, or discussing code | coding, codex, repo, test, verification, tnpm |
+| `writing` | Writing prose, docs, emails, messages | writing, prose, docs, tone, style |
+| `communication` | How to interact with the user | communication, tone, brevity, detail, emoji |
+| `design` | UI/UX, visual design, layout | design, ui, ux, layout, visual, color |
+| `review` | Code review, PR feedback | review, pr, diff, feedback, approve |
+
+You can define additional scenarios in `~/.aizo/scenarios.yaml`. If no scenario matches
+the task domain, skip scenario-based recall and use a plain keyword recall instead.
+
+### Step 2 — Recall preferences for that scenario
 
 Run this *before* generating, not after:
 
 ```bash
-# scenario preset — expands to ~10 relevant keywords automatically
+# Primary: scenario-based recall — pulls entries tagged with the scenario
+# plus entries matching the scenario's configured keywords.
 aizo recall --scenario coding --type preference,style,habit,taboo --limit 20
 
-# or a targeted keyword + type
+# For stricter filtering, add --min-score to suppress weak/irrelevant entries:
+aizo recall --scenario coding --type preference,style,habit,taboo --min-score 3.0 --limit 20
+
+# Supplement with a targeted keyword recall for the specific subtopic:
 aizo recall "<primary topic keyword>" --type preference,style,taboo
+
+# Always check for hard limits regardless of scenario:
+aizo recall --type taboo
 ```
 
-Examples:
-- About to write code → `aizo recall --scenario coding --type preference,style,habit,taboo --limit 20`
-- About to write a document → `aizo recall --scenario writing --type preference,style --limit 10`
-- Quick check for hard limits → `aizo recall --type taboo`
+### Step 3 — Inject results into session context
 
-If recall returns results, incorporate them as silent constraints — do not announce
-"according to your preferences…" unless relevant. Just apply them.
+Format the recall output into a compact block and hold it in your working context for
+the duration of this task. Do not write it to disk — it is session-scoped:
 
-If recall returns nothing, proceed normally. Absence of a preference is not a
-preference.
+```
+[Relevant Preferences — coding scenario]
+Strong likes: concise code (9.0), terse naming (8.0)
+Style: prefers functional patterns (7.5)
+Habits: uses CLI tools (5.0)
+Hard limits: never use emojis in code (0.5)
+```
+
+### Step 4 — Apply silently
+
+Incorporate the recalled preferences as silent constraints. Do NOT announce "according
+to your preferences…" or "based on your aizo profile…". Just apply them.
+
+### Step 5 — Keep it fresh
+
+Preferences evolve. Re-run scenario recall when the task domain changes (e.g., switching
+from coding to writing). Do NOT cache scenario recall results across task domains — the
+relevant preferences differ.
+
+### Recall strategies by task scope
+
+| Task scope | Recall strategy |
+|---|---|
+| Quick question, no generation | Skip — no recall needed |
+| Small generation (single function, short reply) | `aizo recall <keyword> --type preference,taboo` |
+| Substantial generation (PR, document, design) | `aizo recall --scenario <X> --type preference,style,habit,taboo --min-score 3.0 --limit 20` |
+| High-stakes or user explicitly picky | Above + `--min-score 1.5` (lower threshold to catch aversions too) |
+| New topic, no scenario defined | `aizo recall <topic> --type preference,style,taboo` |
+| Any task | `aizo recall --type taboo` (always check hard limits) |
+
+### What if recall returns nothing?
+
+Absence of a preference is not a preference. Proceed normally with your default
+behaviour — the user hasn't expressed anything about this scenario yet.
+
+### Important: scenario-scoped vs global
+
+Preferences tagged with a scenario (`--scenario coding`) only surface when you recall
+that scenario. Preferences without a scenario tag appear in plain keyword recall but
+NOT in scenario-based recall (which requires either the scenario tag or a keyword match
+from the scenario config). This is intentional: it prevents preference leakage across
+unrelated task domains.
+
+When the user expresses a context-specific preference, tag it with the relevant scenario:
+
+```bash
+# This preference only applies to coding — tag it accordingly
+aizo add "no emojis in code" "Rejected emoji in a PR comment" --score 1.5
+aizo tag "no emojis in code" coding review
+```
+
+Now it surfaces when recalling `coding` or `review`, but not when recalling `writing`.
 
 ---
 
