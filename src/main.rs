@@ -69,6 +69,9 @@ enum Command {
         /// Scenario — pulls entries tagged with this scenario + expanded keywords
         #[arg(long)]
         scenario: Option<String>,
+        /// Minimum base_score for results (0.0–10.0); overrides band lower bounds
+        #[arg(long)]
+        min_score: Option<f64>,
         /// Do not refresh last_seen for matched entries
         #[arg(long)]
         no_touch: bool,
@@ -798,13 +801,25 @@ fn main() -> Result<()> {
             print_analyze_summary(&result.entries);
         }
 
-        Command::Recall { query, score_bands, types, limit, scenario, no_touch, json } => {
+        Command::Recall { query, score_bands, types, limit, scenario, min_score, no_touch, json } => {
             // Merge --score-band and deprecated --type
             let mut bands = score_bands;
             if bands.is_empty() { bands = types; }
-            let ranges: Vec<(f64, f64)> = bands.iter()
+            let mut ranges: Vec<(f64, f64)> = bands.iter()
                 .map(|t| parse_score_band(t))
                 .collect::<Result<_>>()?;
+
+            // Apply --min-score: clamp each band's lower bound, or add an open-ended band
+            if let Some(min) = min_score {
+                if ranges.is_empty() {
+                    ranges.push((min, 10.0));
+                } else {
+                    ranges = ranges.into_iter()
+                        .filter(|(_, max)| *max >= min)
+                        .map(|(lo, hi)| (lo.max(min), hi))
+                        .collect();
+                }
+            }
 
             let prefs = if let Some(s) = scenario.as_deref() {
                 // Scenario-based recall: exact match + keyword expansion
@@ -848,7 +863,9 @@ fn main() -> Result<()> {
             };
 
             if prefs.is_empty() {
-                let scope = if bands.is_empty() { String::new() }
+                let scope = if bands.is_empty() && min_score.is_none() { String::new() }
+                            else if bands.is_empty() { format!(" [≥{:.1}]", min_score.unwrap()) }
+                            else if let Some(m) = min_score { format!(" [≥{:.1}, {}]", m, bands.join(", ")) }
                             else { format!(" [{}]", bands.join(", ")) };
                 let what  = query.as_deref().unwrap_or(scenario.as_deref().unwrap_or("*"));
                 println!("No preferences matched \"{what}\"{scope}.");
