@@ -77,9 +77,22 @@ enum Command {
 
     /// Print the full preference profile sorted by effective weight (read-only, no touch)
     Show {
+        /// Score-range filter by band name (repeatable or comma-separated): preference, style, habit, aversion, taboo
+        #[arg(long = "score-band", value_delimiter = ',')]
+        score_bands: Vec<String>,
+        /// Deprecated alias for --score-band
+        #[arg(long = "type", short = 't', value_delimiter = ',')]
+        types: Vec<String>,
         /// Output raw JSON instead of human-readable text
         #[arg(long)]
         json: bool,
+    },
+
+    /// Export preference profile to portable JSON (importable with `aizo import`)
+    Export {
+        /// Output file path; prints to stdout if omitted
+        #[arg(long, short = 'o')]
+        output: Option<std::path::PathBuf>,
     },
 
     /// Manually add or update a preference
@@ -338,7 +351,7 @@ fn scenario_recall(
         }
     }
     // Re-sort by effective_weight
-    merged.sort_by(|a, b| b.effective_weight.partial_cmp(&a.effective_weight).unwrap());
+    merged.sort_by(|a, b| b.effective_weight.partial_cmp(&a.effective_weight).unwrap_or(std::cmp::Ordering::Equal));
     if let Some(n) = limit { merged.truncate(n); }
     if touch {
         for p in &merged {
@@ -532,12 +545,41 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Show { json } => {
-            let prefs = db.all()?;
+        Command::Show { score_bands, types, json } => {
+            let mut bands = score_bands;
+            if bands.is_empty() { bands = types; }
+            let ranges: Vec<(f64, f64)> = bands.iter()
+                .map(|t| parse_score_band(t))
+                .collect::<Result<_>>()?;
+            let prefs = if ranges.is_empty() {
+                db.all()?
+            } else {
+                db.recall(&[], &ranges, None, None, false)?
+            };
             if prefs.is_empty() {
                 println!("No preferences recorded yet.");
             } else {
                 print_entries(&prefs, json);
+            }
+        }
+
+        Command::Export { output } => {
+            let prefs = db.all()?;
+            let entries: Vec<serde_json::Value> = prefs.iter().map(|p| serde_json::json!({
+                "item":       p.item,
+                "reason":     p.reason,
+                "keywords":   p.keywords,
+                "scenarios":  p.scenarios,
+                "base_score": p.base_score,
+            })).collect();
+            let payload = serde_json::json!({ "entries": entries });
+            let text = serde_json::to_string_pretty(&payload)?;
+            match output {
+                Some(path) => {
+                    std::fs::write(&path, &text)?;
+                    println!("Exported {} entries to {}", prefs.len(), path.display());
+                }
+                None => println!("{text}"),
             }
         }
 

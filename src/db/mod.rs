@@ -526,7 +526,7 @@ impl Db {
          FROM preferences";
 
     fn sorted(mut rows: Vec<Preference>) -> Vec<Preference> {
-        rows.sort_by(|a, b| b.effective_weight.partial_cmp(&a.effective_weight).unwrap());
+        rows.sort_by(|a, b| b.effective_weight.partial_cmp(&a.effective_weight).unwrap_or(std::cmp::Ordering::Equal));
         rows
     }
 
