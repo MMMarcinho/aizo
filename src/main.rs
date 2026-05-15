@@ -88,7 +88,7 @@ enum Command {
         json: bool,
     },
 
-    /// Export preference profile to portable JSON (importable with `aizo import`)
+    /// Export preference profile to portable JSON
     Export {
         /// Output file path; prints to stdout if omitted
         #[arg(long, short = 'o')]
