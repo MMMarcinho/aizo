@@ -51,7 +51,10 @@ enum Command {
         /// Do not refresh last_seen for matched entries
         #[arg(long)]
         no_touch: bool,
-        /// Output raw JSON instead of human-readable text
+        /// Output format: human (default), json, context
+        #[arg(long, default_value = "human")]
+        format: String,
+        /// Shorthand for --format json
         #[arg(long)]
         json: bool,
     },
@@ -70,7 +73,10 @@ enum Command {
         /// Scenario — pulls entries tagged with this scenario + expanded keywords
         #[arg(long)]
         scenario: Option<String>,
-        /// Output raw JSON instead of human-readable text
+        /// Output format: human (default), json, context
+        #[arg(long, default_value = "human")]
+        format: String,
+        /// Shorthand for --format json
         #[arg(long)]
         json: bool,
     },
@@ -83,7 +89,10 @@ enum Command {
         /// Deprecated alias for --score-band
         #[arg(long = "type", short = 't', value_delimiter = ',')]
         types: Vec<String>,
-        /// Output raw JSON instead of human-readable text
+        /// Output format: human (default), json, context
+        #[arg(long, default_value = "human")]
+        format: String,
+        /// Shorthand for --format json
         #[arg(long)]
         json: bool,
     },
@@ -361,29 +370,64 @@ fn scenario_recall(
     Ok(merged)
 }
 
-fn print_entries(entries: &[Preference], json: bool) {
-    if json {
-        println!("{}", serde_json::to_string_pretty(entries).unwrap());
-        return;
-    }
+fn resolve_format(format: &str, json: bool) -> &str {
+    if json { "json" } else { format }
+}
 
-    let high = entries.iter().filter(|e| e.base_score >= 7.0).count();
-    let low  = entries.iter().filter(|e| e.base_score <= 3.0).count();
-    let mid  = entries.len() - high - low;
-
-    let mut parts = Vec::new();
-    if high > 0 { parts.push(format!("{high} liked")); }
-    if mid  > 0 { parts.push(format!("{mid} neutral")); }
-    if low  > 0 { parts.push(format!("{low} disliked")); }
-    println!("{} entries  ({})", entries.len(), parts.join(" · "));
-    println!();
-
-    for e in entries {
-        if e.scenarios.is_empty() {
-            println!("  {:<28}  {:>4.1}   {}", e.item, e.effective_weight, e.reason);
-        } else {
-            println!("  {:<28}  {:>4.1}   {}  [{}]", e.item, e.effective_weight, e.reason, e.scenarios.join(", "));
+fn print_entries(entries: &[Preference], format: &str) {
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(entries).unwrap());
         }
+        "context" => {
+            print_context(entries);
+        }
+        _ => {
+            let high = entries.iter().filter(|e| e.base_score >= 7.0).count();
+            let low  = entries.iter().filter(|e| e.base_score <= 3.0).count();
+            let mid  = entries.len() - high - low;
+
+            let mut parts = Vec::new();
+            if high > 0 { parts.push(format!("{high} liked")); }
+            if mid  > 0 { parts.push(format!("{mid} neutral")); }
+            if low  > 0 { parts.push(format!("{low} disliked")); }
+            println!("{} entries  ({})", entries.len(), parts.join(" · "));
+            println!();
+
+            for e in entries {
+                if e.scenarios.is_empty() {
+                    println!("  {:<28}  {:>4.1}   {}", e.item, e.effective_weight, e.reason);
+                } else {
+                    println!("  {:<28}  {:>4.1}   {}  [{}]", e.item, e.effective_weight, e.reason, e.scenarios.join(", "));
+                }
+            }
+        }
+    }
+}
+
+fn print_context(entries: &[Preference]) {
+    let loves:  Vec<&Preference> = entries.iter().filter(|e| e.base_score >= 7.0).collect();
+    let habits: Vec<&Preference> = entries.iter().filter(|e| e.base_score >= 4.0 && e.base_score < 7.0).collect();
+    let dis:    Vec<&Preference> = entries.iter().filter(|e| e.base_score >= 1.5 && e.base_score < 4.0).collect();
+    let taboos: Vec<&Preference> = entries.iter().filter(|e| e.base_score < 1.5).collect();
+
+    println!("[User Preferences]");
+
+    if !loves.is_empty() {
+        let items: Vec<String> = loves.iter().map(|e| format!("{} ({:.1})", e.item, e.effective_weight)).collect();
+        println!("Loves:       {}", items.join(", "));
+    }
+    if !habits.is_empty() {
+        let items: Vec<String> = habits.iter().map(|e| format!("{} ({:.1})", e.item, e.effective_weight)).collect();
+        println!("Habits:      {}", items.join(", "));
+    }
+    if !dis.is_empty() {
+        let items: Vec<String> = dis.iter().map(|e| format!("{} ({:.1})", e.item, e.effective_weight)).collect();
+        println!("Dislikes:    {}", items.join(", "));
+    }
+    if !taboos.is_empty() {
+        let items: Vec<String> = taboos.iter().map(|e| e.item.clone()).collect();
+        println!("Hard limits: {}", items.join(", "));
     }
 }
 
@@ -485,7 +529,8 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Recall { query, score_bands, types, limit, scenario, min_score, no_touch, json } => {
+        Command::Recall { query, score_bands, types, limit, scenario, min_score, no_touch, format, json } => {
+            let format = resolve_format(&format, json);
             // Merge --score-band and deprecated --type
             let mut bands = score_bands;
             if bands.is_empty() { bands = types; }
@@ -520,11 +565,12 @@ fn main() -> Result<()> {
                 let what  = query.as_deref().unwrap_or(scenario.as_deref().unwrap_or("*"));
                 println!("No preferences matched \"{what}\"{scope}.");
             } else {
-                print_entries(&prefs, json);
+                print_entries(&prefs, format);
             }
         }
 
-        Command::Top { n, score_bands, types, scenario, json } => {
+        Command::Top { n, score_bands, types, scenario, format, json } => {
+            let format = resolve_format(&format, json);
             let mut bands = score_bands;
             if bands.is_empty() { bands = types; }
             let ranges: Vec<(f64, f64)> = bands.iter()
@@ -540,12 +586,13 @@ fn main() -> Result<()> {
             if prefs.is_empty() {
                 println!("No preferences recorded yet.");
             } else {
-                let limited: Vec<&Preference> = prefs.iter().take(n).collect();
-                print_entries(&limited.iter().map(|&p| p.clone()).collect::<Vec<_>>(), json);
+                let limited: Vec<Preference> = prefs.into_iter().take(n).collect();
+                print_entries(&limited, format);
             }
         }
 
-        Command::Show { score_bands, types, json } => {
+        Command::Show { score_bands, types, format, json } => {
+            let format = resolve_format(&format, json);
             let mut bands = score_bands;
             if bands.is_empty() { bands = types; }
             let ranges: Vec<(f64, f64)> = bands.iter()
@@ -559,7 +606,7 @@ fn main() -> Result<()> {
             if prefs.is_empty() {
                 println!("No preferences recorded yet.");
             } else {
-                print_entries(&prefs, json);
+                print_entries(&prefs, format);
             }
         }
 
