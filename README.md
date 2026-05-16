@@ -70,19 +70,19 @@ agent observation  (praise, complaint, rule, habit)
 
 All scoring logic lives in `src/scoring/mod.rs`. Every preference entry carries three computed fields, derived at read time from its `base_score` and `last_seen` timestamp.
 
-**Step 1 — Decay coefficient** $d(t)$
+**Step 1 — Decay coefficient d(t)**
 
 $$d(t) = \phi + (1 - \phi) \cdot e^{-\lambda t}, \quad \lambda = \frac{\ln 2}{t_{1/2}}$$
 
-where $t$ is days since `last_seen`, $t_{1/2}$ is the configured half-life, and $\phi$ is the floor.
+where t is days since `last_seen`, t½ (half-life) is the configured half-life, and φ (floor) is the minimum decay.
 
-**Step 2 — Score-dependent exponent** $\alpha$
+**Step 2 — Score-dependent exponent α**
 
 $$\alpha = \frac{10 - s}{10}$$
 
-Higher score → smaller $\alpha$ → decay has less effect. A score-10 preference ($\alpha = 0$) is fully decay-resistant; a score-0 entry ($\alpha = 1$) decays at full speed.
+Higher score → smaller α → decay has less effect. A score-10 preference (α = 0) is fully decay-resistant; a score-0 entry (α = 1) decays at full speed.
 
-**Step 3 — Effective weight** $w$
+**Step 3 — Effective weight w**
 
 $$w = s \cdot d(t)^{\alpha}$$
 
@@ -92,13 +92,13 @@ $$\boxed{w = s \cdot \left[\phi + (1-\phi) \cdot e^{-\lambda t}\right]^{\frac{10
 
 **Boundary behaviour**
 
-| Score $s$ | $\alpha$ | Decay effect | Interpretation |
+| Score s | α | Decay effect | Interpretation |
 |---|---|---|---|
-| 10 | 0.0 | None — $d^0 = 1$ | Core value, never fades |
+| 10 | 0.0 | None (d⁰ = 1) | Core value, never fades |
 | 7  | 0.3 | Slight | Strong preference, slow fade |
 | 5  | 0.5 | Moderate | Neutral habit, fades at half speed |
 | 1  | 0.9 | Near-full | Weak aversion, fades quickly |
-| 0  | 1.0 | Full | $w = 0$ always — absolute zero |
+| 0  | 1.0 | Full (w = 0) | Absolute zero |
 
 Entries are **never hard-deleted by decay** — they sink toward the floor and persist as weak long-term memory. Use `aizo recall --type taboo` to surface hard limits regardless of effective weight.
 
