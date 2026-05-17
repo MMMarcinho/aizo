@@ -366,11 +366,12 @@ fn print_entries(entries: &[Preference], json: bool) {
     println!();
 
     for e in entries {
-        if e.scenarios.is_empty() {
-            println!("  {:<28}  {:>4.1}   {}", e.item, e.effective_weight, e.reason);
-        } else {
-            println!("  {:<28}  {:>4.1}   {}  [{}]", e.item, e.effective_weight, e.reason, e.scenarios.join(", "));
-        }
+        let extras: Vec<String> = std::iter::empty()
+            .chain(e.scenarios.iter().map(|s| s.clone()))
+            .chain(if e.touch_count > 0 { Some(format!("t:{}", e.touch_count)) } else { None })
+            .collect();
+        let tag = if extras.is_empty() { String::new() } else { format!("  [{}]", extras.join("] [")) };
+        println!("  {:<28}  {:>4.1}   {}{}", e.item, e.effective_weight, e.reason, tag);
     }
 }
 

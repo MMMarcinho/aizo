@@ -18,6 +18,7 @@ pub struct Preference {
     pub source: String,         // "analysis" | "manual"
     pub added_at: String,
     pub last_seen: String,      // reset on every reinforcement; drives decay clock
+    pub touch_count: i64,       // number of times this entry has been touched
     pub score_exponent: f64,    // α = (10 − s) / 10
     pub decay_coefficient: f64, // d(t) ∈ [floor, 1.0]
     pub effective_weight: f64,  // w = s · d(t)^α
@@ -175,6 +176,14 @@ impl Db {
         }
 
         self.set_version(6)?;
+
+        if version < 7 {
+            self.conn.execute_batch("
+                ALTER TABLE preferences ADD COLUMN touch_count INTEGER NOT NULL DEFAULT 0;
+            ")?;
+        }
+
+        self.set_version(7)?;
         Ok(())
     }
 
@@ -239,7 +248,7 @@ impl Db {
     // ── Row hydration ────────────────────────────────────────────────────────
 
     // SELECT column order: id(0) item(1) reason(2) keywords(3) base_score(4)
-    //                      source(5) added_at(6) last_seen(7)
+    //                      source(5) added_at(6) last_seen(7) touch_count(8)
     fn hydrate(row: &rusqlite::Row, cfg: &DecayConfig) -> rusqlite::Result<Preference> {
         let last_seen: String = row.get(7)?;
         let keywords_raw: String = row.get(3)?;
@@ -262,6 +271,7 @@ impl Db {
             source:            row.get(5)?,
             added_at:          row.get(6)?,
             last_seen,
+            touch_count:       row.get(8)?,
             score_exponent:    s.score_exponent,
             decay_coefficient: s.decay_coefficient,
             effective_weight:  s.effective_weight,
@@ -363,7 +373,7 @@ impl Db {
             .collect::<Vec<_>>()
             .join(", ");
         let sql = format!(
-            "UPDATE preferences SET last_seen = ?1 WHERE id IN ({})",
+            "UPDATE preferences SET last_seen = ?1, touch_count = touch_count + 1 WHERE id IN ({})",
             placeholders
         );
         let mut stmt = self.conn.prepare(&sql)?;
@@ -379,7 +389,7 @@ impl Db {
     pub fn touch(&self, item: &str) -> Result<bool> {
         let now = Utc::now().to_rfc3339();
         let n = self.conn.execute(
-            "UPDATE preferences SET last_seen = ?1 WHERE LOWER(item) = LOWER(?2)",
+            "UPDATE preferences SET last_seen = ?1, touch_count = touch_count + 1 WHERE LOWER(item) = LOWER(?2)",
             params![now, item],
         )?;
         Ok(n > 0)
@@ -522,7 +532,7 @@ impl Db {
     }
 
     const SELECT: &'static str =
-        "SELECT id, item, reason, keywords, base_score, source, added_at, last_seen
+        "SELECT id, item, reason, keywords, base_score, source, added_at, last_seen, touch_count
          FROM preferences";
 
     fn sorted(mut rows: Vec<Preference>) -> Vec<Preference> {
