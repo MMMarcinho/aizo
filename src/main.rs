@@ -1,5 +1,6 @@
 mod db;
 mod scoring;
+mod web;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -155,6 +156,16 @@ enum Command {
         #[command(subcommand)]
         action: ConfigCmd,
     },
+
+    /// Start a local web server to browse preferences visually
+    Web {
+        /// Port to listen on [env: AIZO_WEB_PORT]
+        #[arg(long, default_value = "2342", env = "AIZO_WEB_PORT")]
+        port: u16,
+        /// Do not automatically open the browser
+        #[arg(long)]
+        no_open: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -192,7 +203,7 @@ fn score_label(score: f64) -> &'static str {
 }
 
 /// Map a score-band name to a (min, max) base_score range (inclusive).
-fn parse_score_band(t: &str) -> Result<(f64, f64)> {
+pub(crate) fn parse_score_band(t: &str) -> Result<(f64, f64)> {
     match t.trim() {
         "preference" | "pref" | "like" | "love" => Ok((7.0, 10.0)),
         "style"                                  => Ok((6.5, 10.0)),
@@ -208,15 +219,15 @@ fn parse_score_band(t: &str) -> Result<(f64, f64)> {
 // ── Scenario config ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
-struct ScenarioDef {
+pub(crate) struct ScenarioDef {
     #[serde(default)]
-    description: String,
-    keywords: Vec<String>,
+    pub(crate) description: String,
+    pub(crate) keywords: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ScenarioConfig {
-    scenarios: HashMap<String, ScenarioDef>,
+pub(crate) struct ScenarioConfig {
+    pub(crate) scenarios: HashMap<String, ScenarioDef>,
 }
 
 /// Load ~/.aizo/scenarios.yaml, auto-initializing with built-in defaults if missing.
@@ -667,6 +678,17 @@ fn main() -> Result<()> {
                 db.set_decay_config(cfg.half_life_days, floor)?;
                 println!("Decay floor set to {floor}.");
             }
+        },
+
+        Command::Web { port, no_open } => {
+            let rt = tokio::runtime::Runtime::new()
+                .context("failed to create async runtime")?;
+            rt.block_on(web::serve(
+                db,
+                load_scenario_config()?,
+                port,
+                !no_open,
+            ))?;
         },
     }
 
