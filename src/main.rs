@@ -558,12 +558,16 @@ fn main() -> Result<()> {
             };
 
             if prefs.is_empty() {
-                let scope = if bands.is_empty() && min_score.is_none() { String::new() }
-                            else if bands.is_empty() { format!(" [≥{:.1}]", min_score.unwrap()) }
-                            else if let Some(m) = min_score { format!(" [≥{:.1}, {}]", m, bands.join(", ")) }
-                            else { format!(" [{}]", bands.join(", ")) };
-                let what  = query.as_deref().unwrap_or(scenario.as_deref().unwrap_or("*"));
-                println!("No preferences matched \"{what}\"{scope}.");
+                if format == "json" {
+                    println!("[]");
+                } else {
+                    let scope = if bands.is_empty() && min_score.is_none() { String::new() }
+                                else if bands.is_empty() { format!(" [≥{:.1}]", min_score.unwrap()) }
+                                else if let Some(m) = min_score { format!(" [≥{:.1}, {}]", m, bands.join(", ")) }
+                                else { format!(" [{}]", bands.join(", ")) };
+                    let what  = query.as_deref().unwrap_or(scenario.as_deref().unwrap_or("*"));
+                    println!("No preferences matched \"{what}\"{scope}.");
+                }
             } else {
                 print_entries(&prefs, format);
             }
@@ -584,7 +588,7 @@ fn main() -> Result<()> {
             };
 
             if prefs.is_empty() {
-                println!("No preferences recorded yet.");
+                if format == "json" { println!("[]"); } else { println!("No preferences recorded yet."); }
             } else {
                 let limited: Vec<Preference> = prefs.into_iter().take(n).collect();
                 print_entries(&limited, format);
@@ -604,7 +608,7 @@ fn main() -> Result<()> {
                 db.recall(&[], &ranges, None, None, false)?
             };
             if prefs.is_empty() {
-                println!("No preferences recorded yet.");
+                if format == "json" { println!("[]"); } else { println!("No preferences recorded yet."); }
             } else {
                 print_entries(&prefs, format);
             }

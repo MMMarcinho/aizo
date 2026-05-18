@@ -659,3 +659,365 @@ impl Stats {
         self.high + self.mid + self.low
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn tmp_db() -> (TempDir, Db) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("test.db");
+        let db = Db::open(&path).unwrap();
+        (dir, db)
+    }
+
+    fn add(db: &Db, item: &str, reason: &str, score: f64) {
+        db.upsert(item, reason, &[], &[], score, "manual").unwrap();
+    }
+
+    // ── upsert ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_creates_entry() {
+        let (_d, db) = tmp_db();
+        add(&db, "dark mode", "uses dark theme", 5.0);
+        let all = db.all().unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].item, "dark mode");
+        assert!((all[0].base_score - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn upsert_score_smoothing() {
+        let (_d, db) = tmp_db();
+        add(&db, "item", "first", 8.0);
+        add(&db, "item", "second", 10.0);
+        let all = db.all().unwrap();
+        assert_eq!(all.len(), 1);
+        let expected = 8.0 * 0.4 + 10.0 * 0.6;
+        assert!((all[0].base_score - expected).abs() < 0.001,
+            "expected {expected}, got {}", all[0].base_score);
+    }
+
+    #[test]
+    fn upsert_case_insensitive_dedup() {
+        let (_d, db) = tmp_db();
+        add(&db, "Dark Mode", "uses dark theme", 5.0);
+        add(&db, "dark mode", "confirmed dark theme", 6.0);
+        assert_eq!(db.all().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn upsert_preserves_keywords_and_scenarios() {
+        let (_d, db) = tmp_db();
+        db.upsert("item", "reason",
+            &["brevity".to_string(), "minimal".to_string()],
+            &["coding".to_string()],
+            9.0, "manual").unwrap();
+        let all = db.all().unwrap();
+        assert_eq!(all[0].keywords, vec!["brevity", "minimal"]);
+        assert_eq!(all[0].scenarios, vec!["coding"]);
+    }
+
+    #[test]
+    fn upsert_replaces_scenarios_on_re_upsert() {
+        let (_d, db) = tmp_db();
+        db.upsert("item", "r", &[], &["coding".to_string()], 5.0, "manual").unwrap();
+        db.upsert("item", "r", &[], &["writing".to_string()], 5.0, "manual").unwrap();
+        let all = db.all().unwrap();
+        assert_eq!(all[0].scenarios, vec!["writing"]);
+    }
+
+    // ── recall ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn recall_by_item_keyword() {
+        let (_d, db) = tmp_db();
+        add(&db, "concise code", "likes short implementations", 9.0);
+        add(&db, "dark mode", "uses dark theme", 5.0);
+        let r = db.recall(&["concise"], &[], None, None, false).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].item, "concise code");
+    }
+
+    #[test]
+    fn recall_matches_reason_field() {
+        let (_d, db) = tmp_db();
+        add(&db, "dark mode", "prefers dark interface theme", 5.0);
+        let r = db.recall(&["interface"], &[], None, None, false).unwrap();
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn recall_matches_keywords_field() {
+        let (_d, db) = tmp_db();
+        db.upsert("item", "r", &["brevity".to_string()], &[], 9.0, "manual").unwrap();
+        let r = db.recall(&["brevity"], &[], None, None, false).unwrap();
+        assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn recall_empty_query_returns_all() {
+        let (_d, db) = tmp_db();
+        add(&db, "a", "r", 5.0);
+        add(&db, "b", "r", 7.0);
+        let r = db.recall(&[], &[], None, None, false).unwrap();
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn recall_score_range_taboo_only() {
+        let (_d, db) = tmp_db();
+        add(&db, "emojis",  "never",   0.5);
+        add(&db, "verbose", "dislikes", 2.5);
+        add(&db, "dark",    "neutral",  5.0);
+        add(&db, "concise", "loves",    9.0);
+        let r = db.recall(&[], &[(0.0, 1.5)], None, None, false).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].item, "emojis");
+    }
+
+    #[test]
+    fn recall_multiple_ranges_ored() {
+        let (_d, db) = tmp_db();
+        add(&db, "emojis",  "never",   0.5);
+        add(&db, "dark",    "neutral",  5.0);
+        add(&db, "concise", "loves",    9.0);
+        // taboo OR preference
+        let r = db.recall(&[], &[(0.0, 1.5), (7.0, 10.0)], None, None, false).unwrap();
+        assert_eq!(r.len(), 2);
+    }
+
+    #[test]
+    fn recall_sorted_descending_by_weight() {
+        let (_d, db) = tmp_db();
+        add(&db, "low",  "r", 2.0);
+        add(&db, "high", "r", 9.0);
+        add(&db, "mid",  "r", 5.0);
+        let r = db.all().unwrap();
+        assert!(r[0].effective_weight >= r[1].effective_weight);
+        assert!(r[1].effective_weight >= r[2].effective_weight);
+    }
+
+    #[test]
+    fn recall_limit_respected() {
+        let (_d, db) = tmp_db();
+        for i in 0..10 { add(&db, &format!("item{i}"), "r", 5.0); }
+        let r = db.recall(&[], &[], None, Some(3), false).unwrap();
+        assert_eq!(r.len(), 3);
+    }
+
+    #[test]
+    fn recall_touch_updates_last_seen() {
+        let (_d, db) = tmp_db();
+        add(&db, "item", "r", 5.0);
+        let before = db.all().unwrap()[0].last_seen.clone();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        db.recall(&["item"], &[], None, None, true).unwrap();
+        let after = db.all().unwrap()[0].last_seen.clone();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn recall_no_touch_preserves_last_seen() {
+        let (_d, db) = tmp_db();
+        add(&db, "item", "r", 5.0);
+        let before = db.all().unwrap()[0].last_seen.clone();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        db.recall(&["item"], &[], None, None, false).unwrap();
+        assert_eq!(db.all().unwrap()[0].last_seen, before);
+    }
+
+    #[test]
+    fn recall_scenario_filter() {
+        let (_d, db) = tmp_db();
+        db.upsert("coding pref", "r", &[], &["coding".to_string()], 9.0, "manual").unwrap();
+        db.upsert("writing pref", "r", &[], &["writing".to_string()], 8.0, "manual").unwrap();
+        let r = db.recall(&[], &[], Some("coding"), None, false).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].item, "coding pref");
+    }
+
+    // ── touch ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn touch_updates_last_seen() {
+        let (_d, db) = tmp_db();
+        add(&db, "item", "r", 5.0);
+        let before = db.all().unwrap()[0].last_seen.clone();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(db.touch("item").unwrap());
+        assert_ne!(db.all().unwrap()[0].last_seen, before);
+    }
+
+    #[test]
+    fn touch_does_not_change_score() {
+        let (_d, db) = tmp_db();
+        add(&db, "item", "r", 7.5);
+        db.touch("item").unwrap();
+        assert!((db.all().unwrap()[0].base_score - 7.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn touch_case_insensitive() {
+        let (_d, db) = tmp_db();
+        add(&db, "Dark Mode", "r", 5.0);
+        assert!(db.touch("dark mode").unwrap());
+    }
+
+    #[test]
+    fn touch_not_found_returns_false() {
+        let (_d, db) = tmp_db();
+        assert!(!db.touch("nonexistent").unwrap());
+    }
+
+    // ── remove ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn remove_deletes_entry() {
+        let (_d, db) = tmp_db();
+        add(&db, "item", "r", 5.0);
+        assert!(db.remove("item").unwrap());
+        assert_eq!(db.all().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn remove_not_found_returns_false() {
+        let (_d, db) = tmp_db();
+        assert!(!db.remove("nonexistent").unwrap());
+    }
+
+    #[test]
+    fn remove_cascades_scenarios() {
+        let (_d, db) = tmp_db();
+        db.upsert("item", "r", &[], &["coding".to_string()], 5.0, "manual").unwrap();
+        db.remove("item").unwrap();
+        // after remove + re-add without scenario, scenario should not re-appear
+        add(&db, "item", "r", 5.0);
+        assert!(db.all().unwrap()[0].scenarios.is_empty());
+    }
+
+    // ── update ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn update_score() {
+        let (_d, db) = tmp_db();
+        add(&db, "item", "r", 5.0);
+        assert!(db.update("item", None, None, Some(9.0), None, None).unwrap());
+        assert!((db.all().unwrap()[0].base_score - 9.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn update_reason() {
+        let (_d, db) = tmp_db();
+        add(&db, "item", "old reason", 5.0);
+        db.update("item", None, Some("new reason"), None, None, None).unwrap();
+        assert_eq!(db.all().unwrap()[0].reason, "new reason");
+    }
+
+    #[test]
+    fn update_keywords() {
+        let (_d, db) = tmp_db();
+        add(&db, "item", "r", 5.0);
+        db.update("item", None, None, None,
+            Some(&["k1".to_string(), "k2".to_string()]), None).unwrap();
+        assert_eq!(db.all().unwrap()[0].keywords, vec!["k1", "k2"]);
+    }
+
+    #[test]
+    fn update_item_name() {
+        let (_d, db) = tmp_db();
+        add(&db, "old name", "r", 5.0);
+        db.update("old name", Some("new name"), None, None, None, None).unwrap();
+        assert_eq!(db.all().unwrap()[0].item, "new name");
+    }
+
+    #[test]
+    fn update_not_found_returns_false() {
+        let (_d, db) = tmp_db();
+        assert!(!db.update("nonexistent", None, None, Some(5.0), None, None).unwrap());
+    }
+
+    // ── stats + config ────────────────────────────────────────────────────────
+
+    #[test]
+    fn stats_counts_by_band() {
+        let (_d, db) = tmp_db();
+        add(&db, "h1", "r", 8.0);
+        add(&db, "h2", "r", 7.5);
+        add(&db, "m1", "r", 5.0);
+        add(&db, "l1", "r", 2.0);
+        add(&db, "l2", "r", 0.5);
+        let s = db.stats().unwrap();
+        assert_eq!(s.high, 2);
+        assert_eq!(s.mid, 1);
+        assert_eq!(s.low, 2);
+        assert_eq!(s.total(), 5);
+    }
+
+    #[test]
+    fn decay_config_default_values() {
+        let (_d, db) = tmp_db();
+        let c = db.get_decay_config().unwrap();
+        assert!((c.half_life_days - 30.0).abs() < f64::EPSILON);
+        assert!((c.floor - 0.1).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn decay_config_set_and_get() {
+        let (_d, db) = tmp_db();
+        db.set_decay_config(14.0, 0.05).unwrap();
+        let c = db.get_decay_config().unwrap();
+        assert!((c.half_life_days - 14.0).abs() < f64::EPSILON);
+        assert!((c.floor - 0.05).abs() < f64::EPSILON);
+    }
+
+    // ── keywords ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn all_keywords_counts_correctly() {
+        let (_d, db) = tmp_db();
+        db.upsert("a", "r", &["k1".to_string(), "k2".to_string()], &[], 5.0, "manual").unwrap();
+        db.upsert("b", "r", &["k1".to_string(), "k3".to_string()], &[], 5.0, "manual").unwrap();
+        let kws: std::collections::HashMap<_, _> = db.all_keywords().unwrap().into_iter().collect();
+        assert_eq!(kws["k1"], 2);
+        assert_eq!(kws["k2"], 1);
+        assert_eq!(kws["k3"], 1);
+    }
+
+    // ── top ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn top_returns_n_highest() {
+        let (_d, db) = tmp_db();
+        add(&db, "high", "r", 9.0);
+        add(&db, "mid",  "r", 5.0);
+        add(&db, "low",  "r", 2.0);
+        let r = db.top(2, &[]).unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[0].item, "high");
+        assert_eq!(r[1].item, "mid");
+    }
+
+    #[test]
+    fn top_with_score_range() {
+        let (_d, db) = tmp_db();
+        add(&db, "taboo", "r", 0.5);
+        add(&db, "pref",  "r", 9.0);
+        let r = db.top(10, &[(0.0, 1.5)]).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].item, "taboo");
+    }
+
+    // ── clear ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn clear_removes_all_entries() {
+        let (_d, db) = tmp_db();
+        add(&db, "a", "r", 5.0);
+        add(&db, "b", "r", 7.0);
+        db.clear().unwrap();
+        assert_eq!(db.all().unwrap().len(), 0);
+    }
+}
