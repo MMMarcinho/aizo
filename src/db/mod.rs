@@ -1,11 +1,27 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use crate::scoring::{self, DecayConfig};
+
+pub const TOUCH_COOLDOWN_HOURS: i64 = 12;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TouchStatus {
+    Touched,
+    Cooldown,
+    NotFound,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyResult {
+    pub id: i64,
+    pub item: Option<String>,
+    pub status: TouchStatus,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preference {
@@ -394,39 +410,89 @@ impl Db {
         Ok(())
     }
 
-    /// Bulk-refresh last_seen for a list of row IDs (used internally by recall).
-    fn touch_ids(&self, ids: Vec<i64>) -> Result<()> {
-        if ids.is_empty() {
-            return Ok(());
+    fn touch_allowed(last_seen: &str, now: DateTime<Utc>) -> bool {
+        let Ok(last) = DateTime::parse_from_rfc3339(last_seen) else {
+            return true;
+        };
+        now.signed_duration_since(last.with_timezone(&Utc)) >= Duration::hours(TOUCH_COOLDOWN_HOURS)
+    }
+
+    fn touch_by_id(&self, id: i64, now: DateTime<Utc>) -> Result<ApplyResult> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT item, last_seen FROM preferences WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+
+        let Some((item, last_seen)) = row else {
+            return Ok(ApplyResult {
+                id,
+                item: None,
+                status: TouchStatus::NotFound,
+            });
+        };
+
+        if !Self::touch_allowed(&last_seen, now) {
+            return Ok(ApplyResult {
+                id,
+                item: Some(item),
+                status: TouchStatus::Cooldown,
+            });
         }
-        let now = Utc::now().to_rfc3339();
-        let placeholders = ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 2))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let sql = format!(
-            "UPDATE preferences SET last_seen = ?1, touch_count = touch_count + 1 WHERE id IN ({})",
-            placeholders
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        stmt.execute(rusqlite::params_from_iter(
-            std::iter::once(rusqlite::types::Value::Text(now))
-                .chain(ids.iter().map(|&id| rusqlite::types::Value::Integer(id))),
-        ))?;
-        Ok(())
+
+        self.conn.execute(
+            "UPDATE preferences SET last_seen = ?1, touch_count = touch_count + 1 WHERE id = ?2",
+            params![now.to_rfc3339(), id],
+        )?;
+        Ok(ApplyResult {
+            id,
+            item: Some(item),
+            status: TouchStatus::Touched,
+        })
+    }
+
+    /// Mark recalled entries as actually used, respecting the touch cooldown.
+    pub fn apply_ids(&self, ids: &[i64]) -> Result<Vec<ApplyResult>> {
+        let now = Utc::now();
+        let mut seen = std::collections::HashSet::new();
+        let mut results = Vec::new();
+        for id in ids {
+            if seen.insert(*id) {
+                results.push(self.touch_by_id(*id, now)?);
+            }
+        }
+        Ok(results)
     }
 
     /// Reset the decay clock for one entry without changing its score or reason.
-    /// Returns true if the entry was found and updated, false if not found.
-    pub fn touch(&self, item: &str) -> Result<bool> {
-        let now = Utc::now().to_rfc3339();
-        let n = self.conn.execute(
-            "UPDATE preferences SET last_seen = ?1, touch_count = touch_count + 1 WHERE LOWER(item) = LOWER(?2)",
-            params![now, item],
+    /// Returns whether the entry was updated, cooled down, or missing.
+    pub fn touch(&self, item: &str) -> Result<TouchStatus> {
+        let row: Option<(i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, last_seen FROM preferences WHERE LOWER(item) = LOWER(?1)",
+                params![item],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .ok();
+
+        let Some((id, last_seen)) = row else {
+            return Ok(TouchStatus::NotFound);
+        };
+
+        let now = Utc::now();
+        if !Self::touch_allowed(&last_seen, now) {
+            return Ok(TouchStatus::Cooldown);
+        }
+
+        self.conn.execute(
+            "UPDATE preferences SET last_seen = ?1, touch_count = touch_count + 1 WHERE id = ?2",
+            params![now.to_rfc3339(), id],
         )?;
-        Ok(n > 0)
+        Ok(TouchStatus::Touched)
     }
 
     pub fn remove(&self, item: &str) -> Result<bool> {
@@ -689,7 +755,8 @@ impl Db {
             rows.truncate(n);
         }
         if touch {
-            self.touch_ids(rows.iter().map(|p| p.id).collect())?;
+            let ids: Vec<i64> = rows.iter().map(|p| p.id).collect();
+            self.apply_ids(&ids)?;
         }
         Ok(rows)
     }
@@ -760,6 +827,47 @@ mod tests {
         let prefs = db.all()?;
         assert_eq!(prefs.len(), 1);
         assert_eq!(prefs[0].base_score, 9.0);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn apply_ids_respects_touch_cooldown() -> Result<()> {
+        let path = temp_db_path("touch-cooldown");
+        let db = Db::open(&path)?;
+
+        db.upsert(
+            "concise code",
+            "Prefers short implementations",
+            &[],
+            &[],
+            9.0,
+            "manual",
+        )?;
+        let id = db.all()?[0].id;
+
+        let first = db.apply_ids(&[id])?;
+        assert_eq!(first[0].status, TouchStatus::Cooldown);
+        assert_eq!(db.all()?[0].touch_count, 0);
+
+        let old = (Utc::now() - Duration::hours(TOUCH_COOLDOWN_HOURS + 1)).to_rfc3339();
+        db.conn.execute(
+            "UPDATE preferences SET last_seen = ?1 WHERE id = ?2",
+            params![old, id],
+        )?;
+
+        let second = db.apply_ids(&[id])?;
+        assert_eq!(second[0].status, TouchStatus::Touched);
+        assert_eq!(db.all()?[0].touch_count, 1);
+
+        let third = db.apply_ids(&[id])?;
+        assert_eq!(third[0].status, TouchStatus::Cooldown);
+        assert_eq!(db.all()?[0].touch_count, 1);
 
         drop(db);
         let _ = std::fs::remove_file(&path);

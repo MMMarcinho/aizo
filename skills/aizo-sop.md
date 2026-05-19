@@ -204,7 +204,21 @@ Hard limits: never use emojis in code (0.5)
 Incorporate the recalled preferences as silent constraints. Do NOT announce "according
 to your preferences…" or "based on your aizo profile…". Just apply them.
 
-### Step 5 — Keep it fresh
+### Step 5 — Mark actually used memories
+
+After generating, call `aizo apply` only for the preference IDs that materially shaped
+the response. Recall itself is read-only by default; applying is what refreshes decay,
+and aizo enforces a 12-hour cooldown so repeated use in a short session does not
+inflate `touch_count`.
+
+```bash
+aizo apply <id>...
+```
+
+Use `aizo recall --touch` only for older integrations that still need recall-time
+refresh. Prefer explicit `apply` for new agent workflows.
+
+### Step 6 — Keep it fresh
 
 Preferences evolve. Re-run scenario recall when the task domain changes (e.g., switching
 from coding to writing). Do NOT cache scenario recall results across task domains — the
@@ -253,7 +267,9 @@ Now it surfaces when recalling `coding` or `review`, but not when recalling `wri
 **Problem this solves:** over time, the user demonstrates new preferences that were never
 explicitly captured in real time. This SOP discovers those implicit preferences by having
 your LLM scan past session transcripts and extract new signals — then write them with
-`aizo add`. Existing confirmed preferences get their decay clocks reset via `aizo touch`.
+`aizo add`. Existing confirmed preferences get their decay clocks reset via `aizo apply`
+by id, or `aizo touch` by item label when ids are unavailable. Both paths use a
+12-hour cooldown.
 
 aizo no longer has a built-in `analyze` command. Instead, the agent uses its own LLM
 capability to perform this extraction. This gives you full control over the prompt and
@@ -282,11 +298,11 @@ And these recent interaction sessions:
    Score guide: 0-1.5 = hard limit/taboo, 1.5-4 = aversion, 4-7 = habit, 7-10 = preference.
 
 2. Identify which EXISTING preferences were clearly demonstrated or confirmed.
-   Return ONLY a JSON array of item strings: ["item one", "item two", ...]
+   Prefer returning ids from the known list. If ids are unavailable, return item strings.
    Only include items that were unambiguously present. Return [] if none.
 
 Return your response as:
-{"new": [...], "confirmed": ["item one", ...]}
+{"new": [...], "confirmed_ids": [1, 2], "confirmed": ["item one", ...]}
 ```
 
 4. For each new entry, call:
@@ -294,13 +310,19 @@ Return your response as:
 aizo add "<item>" "<reason>" --score <base_score>
 ```
 
-5. For each confirmed item, call:
+5. For each confirmed id, call:
+```bash
+aizo apply <id>...
+```
+
+If you only have item labels, call:
 ```bash
 aizo touch "<item>"
 ```
 
 6. That's it. New entries are created with source="manual", confirmed entries get their
-decay clocks reset. No LLM API calls from aizo itself — your LLM does the thinking.
+decay clocks reset if they are outside the 12-hour cooldown. No LLM API calls from aizo
+itself — your LLM does the thinking.
 
 **Recommended frequency:** daily for active users, weekly for moderate use. More frequent
 runs improve decay accuracy but cost more in LLM tokens.
@@ -332,16 +354,22 @@ And these recent interactions:
 <paste session logs>
 
 Which preferences were clearly demonstrated or confirmed today?
-Return ONLY a JSON array of item strings: ["item one", "item two", ...]
+Prefer returning ids from the known list. If ids are unavailable, return item strings.
 Only include items that were unambiguously present. Return [] if none.
 ```
 
-4. For each confirmed item returned by the LLM, call:
+4. For confirmed ids returned by the LLM, call:
+```bash
+aizo apply <id>...
+```
+
+If you only have item labels, call:
 ```bash
 aizo touch "<item>"
 ```
 
-5. That's it — no new entries created, no scores changed. Only the decay clock resets.
+5. That's it — no new entries created, no scores changed. Only the decay clock resets
+when the entry is outside the 12-hour cooldown.
 
 **Example cron setup (runs daily at midnight):**
 ```cron

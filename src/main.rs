@@ -4,7 +4,7 @@ mod web;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use db::{Db, Preference};
+use db::{Db, Preference, TouchStatus, TOUCH_COOLDOWN_HOURS};
 use dirs::home_dir;
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -49,7 +49,10 @@ enum Command {
         /// Minimum base_score for results (0.0–10.0); overrides band lower bounds
         #[arg(long)]
         min_score: Option<f64>,
-        /// Do not refresh last_seen for matched entries
+        /// Refresh last_seen for matched entries, subject to the 12-hour touch cooldown
+        #[arg(long)]
+        touch: bool,
+        /// Deprecated no-op: recall is read-only by default
         #[arg(long)]
         no_touch: bool,
         /// Output raw JSON instead of human-readable text
@@ -126,6 +129,13 @@ enum Command {
         /// Item label to refresh (case-insensitive, words joined)
         #[arg(trailing_var_arg = true, num_args = 1..)]
         item: Vec<String>,
+    },
+
+    /// Mark recalled preferences as actually used, by id
+    Apply {
+        /// Preference IDs to apply (from recall/show/top output)
+        #[arg(required = true, num_args = 1..)]
+        ids: Vec<i64>,
     },
 
     /// Remove a preference by item label
@@ -376,9 +386,8 @@ fn scenario_recall(
         merged.truncate(n);
     }
     if touch {
-        for p in &merged {
-            let _ = db.touch(&p.item);
-        }
+        let ids: Vec<i64> = merged.iter().map(|p| p.id).collect();
+        db.apply_ids(&ids)?;
     }
     Ok(merged)
 }
@@ -421,8 +430,8 @@ fn print_entries(entries: &[Preference], json: bool) {
             format!("  [{}]", extras.join("] ["))
         };
         println!(
-            "  {:<28}  {:>4.1}   {}{}",
-            e.item, e.effective_weight, e.reason, tag
+            "  #{:<4} {:<28}  {:>4.1}   {}{}",
+            e.id, e.item, e.effective_weight, e.reason, tag
         );
     }
 }
@@ -552,9 +561,15 @@ fn main() -> Result<()> {
             limit,
             scenario,
             min_score,
+            touch,
             no_touch,
             json,
         } => {
+            if no_touch {
+                eprintln!(
+                    "Note: --no-touch is deprecated; recall is read-only unless --touch is set."
+                );
+            }
             // Merge --score-band and deprecated --type
             let mut bands = score_bands;
             if bands.is_empty() {
@@ -579,10 +594,10 @@ fn main() -> Result<()> {
             }
 
             let prefs = if let Some(s) = scenario.as_deref() {
-                scenario_recall(&db, &ranges, s, limit, !no_touch)?
+                scenario_recall(&db, &ranges, s, limit, touch)?
             } else {
                 let queries: Vec<&str> = query.as_deref().map(|q| vec![q]).unwrap_or_default();
-                db.recall(&queries, &ranges, None, limit, !no_touch)?
+                db.recall(&queries, &ranges, None, limit, touch)?
             };
 
             if prefs.is_empty() {
@@ -740,11 +755,57 @@ fn main() -> Result<()> {
             if item_str.is_empty() {
                 anyhow::bail!("usage: aizo touch <item…>");
             }
-            let found = db.touch(&item_str)?;
-            if found {
-                println!("Touched \"{item_str}\" — decay clock reset.");
-            } else {
-                println!("Not found: \"{item_str}\"");
+            match db.touch(&item_str)? {
+                TouchStatus::Touched => println!("Touched \"{item_str}\" — decay clock reset."),
+                TouchStatus::Cooldown => println!(
+                    "Skipped \"{item_str}\" — touched within the last {TOUCH_COOLDOWN_HOURS} hours."
+                ),
+                TouchStatus::NotFound => println!("Not found: \"{item_str}\""),
+            }
+        }
+
+        Command::Apply { ids } => {
+            let results = db.apply_ids(&ids)?;
+            let touched = results
+                .iter()
+                .filter(|r| r.status == TouchStatus::Touched)
+                .count();
+            let cooled = results
+                .iter()
+                .filter(|r| r.status == TouchStatus::Cooldown)
+                .count();
+            let missing = results
+                .iter()
+                .filter(|r| r.status == TouchStatus::NotFound)
+                .count();
+
+            println!(
+                "Applied {} ids  ({} touched · {} cooldown · {} not found)",
+                results.len(),
+                touched,
+                cooled,
+                missing
+            );
+            for result in results {
+                match result.status {
+                    TouchStatus::Touched => {
+                        println!(
+                            "  #{:<4} touched   {}",
+                            result.id,
+                            result.item.unwrap_or_default()
+                        );
+                    }
+                    TouchStatus::Cooldown => {
+                        println!(
+                            "  #{:<4} cooldown  {}",
+                            result.id,
+                            result.item.unwrap_or_default()
+                        );
+                    }
+                    TouchStatus::NotFound => {
+                        println!("  #{:<4} not found", result.id);
+                    }
+                }
             }
         }
 

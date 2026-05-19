@@ -1,5 +1,7 @@
 # aizo 爱憎
 
+![aizo — AI 智能体偏好记忆](assets/aizo-hero.png)
+
 **aizo**（爱憎，*ài zēng*）是一个专为 AI 智能体设计的轻量、高性能偏好记忆系统，完全用 Rust 构建。
 
 它模仿人类认知记忆的工作方式：不存储完整的对话记录，而是持续地从历史交互中**量化、衰减、召回**用户稳定的偏好、厌恶、习惯、沟通风格和硬性边界。最终形成一个紧凑的、带数值权重的个性画像，任何智能体都能在毫秒内完成查询。
@@ -171,7 +173,8 @@ aizo [--db <路径>] <命令>
 | `show` | 输出完整画像，按有效权重排序（只读） |
 | `add <标签> <原因>` | 手动添加或更新一条偏好 |
 | `update <标签>` | 更新已有词条的字段（标签、原因、分数、关键词、场景） |
-| `touch <标签…>` | 重置衰减时钟，不修改分数 |
+| `apply <id…>` | 标记召回词条已被实际采用；按 12 小时冷却刷新衰减时钟 |
+| `touch <标签…>` | 按标签重置衰减时钟，同样受 12 小时冷却限制 |
 | `remove <标签…>` | 硬删除一条词条 |
 | `keywords` | 列出所有已存储的关键词及词条数 |
 | `scenarios` | 列出所有场景及词条数、配置关键词 |
@@ -188,7 +191,8 @@ aizo [--db <路径>] <命令>
 | `--limit/-l <N>` | 按有效权重排序后限制返回数量 |
 | `--scenario <名称>` | 场景召回 + 关键词扩展（从 `~/.aizo/scenarios.yaml` 读取） |
 | `--min-score <N>` | 最低 `base_score` 阈值（0.0–10.0）；会抬高 score-band 的下界 |
-| `--no-touch` | 不刷新匹配词条的 `last_seen` |
+| `--touch` | 刷新匹配词条，受 12 小时冷却限制；`recall` 默认只读 |
+| `--no-touch` | 已废弃的兼容参数；默认就是不 touch |
 | `--json` | 输出原始 JSON（供程序调用） |
 
 **`top` 标志：** `--score-band/-t`、`--scenario`、`--json`。只读——不会刷新 `last_seen`。
@@ -204,6 +208,9 @@ aizo recall "代码风格"
 
 # 场景化召回（coding 自动展开为约 10 个相关关键词）
 aizo recall --scenario coding --score-band preference,style,habit,taboo --limit 20
+
+# 生成后只标记真正用到的偏好
+aizo apply 3 8 12
 
 # 仅按类型召回（无需关键词）
 aizo recall --score-band taboo                       # 所有硬性边界
@@ -307,10 +314,17 @@ def recall_scenario(scenario: str, min_score: float = 3.0) -> list[dict]:
 def top_preferences(n: int = 10) -> list[dict]:
     return json.loads(subprocess.check_output(["aizo", "top", str(n), "--json"]))
 
+def apply_preferences(ids: list[int]) -> None:
+    """生成后标记实际用到的偏好。"""
+    if ids:
+        subprocess.check_call(["aizo", "apply", *map(str, ids)])
+
 # 即时召回：写代码前拉取编程相关偏好
 coding_prefs = recall_scenario("coding")
 # 注入到会话上下文——不写磁盘
 context = f"[编程偏好]\n{json.dumps(coding_prefs, indent=2, ensure_ascii=False)}"
+# 生成后只 apply 真正影响输出的词条 id
+apply_preferences([p["id"] for p in coding_prefs[:3]])
 
 # 写文档前拉取写作相关偏好
 writing_prefs = recall_scenario("writing")
@@ -335,6 +349,9 @@ aizo show
                                         │
                                         ▼
                              带着偏好生成回复
+                                        │
+                                        ▼
+                             aizo apply <用到的 id>
 ```
 
 这保持了基础上下文的精简，同时让智能体能访问完整的偏好画像。模式类似人类记忆：你不会把每一条偏好都预加载到工作记忆中——只在需要时才想起。
@@ -367,9 +384,9 @@ aizo update "使用主动语态" --scenarios writing
 | 2 | 用户表达负面反馈 | `aizo add … --score 1.5` 再 `aizo recall <主题>` | 同步，修正回复前 |
 | 3 | 用户表达称赞 | `aizo add … --score 9.0` | 异步，回复发送后 |
 | 4 | 用户下达明确指令 | `aizo add … --score 0.5` 或 `--score 10` | 同步，立即执行 |
-| 5 | 即将针对主题 X 生成内容 | 分类任务 → `aizo recall --scenario <X> --min-score 3.0` → 注入上下文 | 同步，生成前 |
-| 6 | 历史会话批量分析 | 智能体 LLM 扫描历史会话 → `aizo add` 新词条 + `aizo touch` 确认旧词条 | 定时，后台执行 |
-| 7 | 每日定时任务 | 智能体 LLM 扫描日志 → `aizo touch` 确认词条 | 定时，后台执行 |
+| 5 | 即将针对主题 X 生成内容 | 分类任务 → `aizo recall --scenario <X> --min-score 3.0` → 注入 → `aizo apply <用到的 id>` | 生成前召回，生成后 apply |
+| 6 | 历史会话批量分析 | 智能体 LLM 扫描历史会话 → `aizo add` 新词条 + `aizo apply`/`touch` 确认旧词条 | 定时，后台执行 |
+| 7 | 每日定时任务 | 智能体 LLM 扫描日志 → `aizo apply`/`touch` 确认词条 | 定时，后台执行 |
 
 **技能文件中的关键规则：**
 - 分数极低（≤ 1.5）的词条优先级永远最高

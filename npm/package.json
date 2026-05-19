@@ -21,6 +21,7 @@
   "files": [
     "install.js",
     "run.js",
-    "README.md"
+    "README.md",
+    "assets"
   ]
 }
