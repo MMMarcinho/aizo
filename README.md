@@ -1,5 +1,7 @@
 # aizo 爱憎
 
+![aizo — preference memory for AI agents](assets/aizo-hero.png)
+
 [中文文档](README.zh.md)
 
 **aizo** (爱憎, *ài zēng*, "love and hate") is a lightweight, high-performance preference memory system for AI agents, built entirely in Rust.
@@ -156,7 +158,8 @@ aizo [--db <path>] <COMMAND>
 | `show` | Full profile sorted by effective weight (read-only) |
 | `add <item> <reason>` | Manually add or update a preference |
 | `update <item>` | Update fields on an existing entry (item, reason, score, keywords, scenarios) |
-| `touch <item…>` | Reset decay clock without changing score |
+| `apply <id…>` | Mark recalled entries as actually used; refreshes decay with a 12-hour cooldown |
+| `touch <item…>` | Reset decay clock by item label, subject to the same 12-hour cooldown |
 | `remove <item…>` | Hard-remove an entry |
 | `keywords` | List all stored keywords with entry counts |
 | `scenarios` | List all scenarios with entry counts and configured keywords |
@@ -172,7 +175,8 @@ aizo [--db <path>] <COMMAND>
 | `--limit/-l <N>` | Cap results after sorting by effective weight |
 | `--scenario <name>` | Scenario-tagged recall + keyword expansion from `~/.aizo/scenarios.yaml` |
 | `--min-score <N>` | Minimum `base_score` threshold (0.0–10.0); clamps band lower bounds |
-| `--no-touch` | Do not refresh `last_seen` for matched entries |
+| `--touch` | Refresh matched entries, subject to the 12-hour cooldown; recall is read-only by default |
+| `--no-touch` | Deprecated no-op kept for older scripts |
 | `--json` | Output raw JSON instead of human-readable text |
 
 **`top` flags:** `--type/-t`, `--scenario`, `--json`. Read-only — never touches `last_seen`.
@@ -199,7 +203,7 @@ aizo recall --type taboo               # all hard limits, no keyword needed
 aizo top 5 --type preference
 ```
 
-Use keywords (`--keywords` on add, or `aizo tag`) to add any taxonomy you want.
+Use keywords (`--keywords` on add, or `aizo update --keywords`) to add any taxonomy you want.
 
 ### Examples
 
@@ -210,6 +214,9 @@ aizo recall "code style"
 
 # Scenario-aware recall for coding tasks (expands to ~10 coding keywords)
 aizo recall --scenario coding --type preference,style,habit,taboo --limit 20
+
+# Mark only the preferences the agent actually used
+aizo apply 3 8 12
 
 # Type-only recall (no keyword — returns all entries in that score range)
 aizo recall --type taboo                        # all hard limits
@@ -274,7 +281,8 @@ CREATE TABLE preferences (
     base_score  REAL    NOT NULL DEFAULT 5.0,   -- 0-10
     source      TEXT    NOT NULL DEFAULT 'manual',
     added_at    TEXT    NOT NULL,
-    last_seen   TEXT    NOT NULL                -- resets decay clock on each reinforcement
+    last_seen   TEXT    NOT NULL,               -- resets decay clock on each reinforcement
+    touch_count INTEGER NOT NULL DEFAULT 0
 );
 -- UNIQUE on LOWER(item)
 
@@ -305,10 +313,17 @@ def recall_scenario(scenario: str, min_score: float = 3.0) -> list[dict]:
 def top_preferences(n: int = 10) -> list[dict]:
     return json.loads(subprocess.check_output(["aizo", "top", str(n), "--json"]))
 
+def apply_preferences(ids: list[int]) -> None:
+    """Call after the agent actually used specific recalled preferences."""
+    if ids:
+        subprocess.check_call(["aizo", "apply", *map(str, ids)])
+
 # Just-in-time: before coding, recall coding-specific preferences
 coding_prefs = recall_scenario("coding")
 # Inject into session context — don't write to disk
 context = f"[Coding preferences]\n{json.dumps(coding_prefs, indent=2)}"
+# After generation, apply only the ids that shaped the response.
+apply_preferences([p["id"] for p in coding_prefs[:3]])
 
 # Before writing a document, recall writing preferences
 writing_prefs = recall_scenario("writing")
@@ -335,6 +350,9 @@ agent receives task ──► classify into scenario ──► aizo recall --sce
                                                           │
                                                           ▼
                                                generate response with preferences applied
+                                                          │
+                                                          ▼
+                                               aizo apply <used ids>
 ```
 
 This keeps the agent's base context lean while giving it access to the full preference
@@ -344,8 +362,11 @@ working memory — you recall the relevant ones when the situation calls for it.
 **Example flow (coding task):**
 
 ```bash
-# Agent classifies the user's request as a coding task, then:
+# Agent classifies the user's request as a coding task, then recalls candidates:
 aizo recall --scenario coding --type preference,style,habit,taboo --min-score 3.0 --limit 20 --json
+
+# After generating, mark only the entries that were actually used:
+aizo apply 3 8 12
 ```
 
 **Example flow (writing task):**
@@ -361,10 +382,10 @@ tasks:
 
 ```bash
 aizo add "no emojis in code" "Rejected emoji in a PR comment" --score 1.5
-aizo tag "no emojis in code" coding review
+aizo update "no emojis in code" --scenarios coding,review
 
 aizo add "use active voice" "Praised direct, active-voice writing" --score 8.5
-aizo tag "use active voice" writing
+aizo update "use active voice" --scenarios writing
 ```
 
 The agent then only sees "no emojis in code" when coding — not when writing casual messages.
@@ -387,9 +408,9 @@ The skill defines seven triggers:
 | 2 | User shows negative feedback | `aizo add … --score 1.5` then `aizo recall <topic>` | Sync, before corrected reply |
 | 3 | User praises something | `aizo add … --score 9.0` | Async, after reply sent |
 | 4 | User states an explicit rule | `aizo add … --score 0.5` or `--score 10` | Sync, immediate |
-| 5 | About to generate on topic X | Classify task → `aizo recall --scenario <X> --min-score 3.0` → inject into context | Sync, before generation |
-| 6 | Historical batch analysis | Agent LLM scans past sessions → `aizo add` new + `aizo touch` confirmed | Scheduled, background |
-| 7 | Daily cron job | Agent LLM scans logs → `aizo touch` confirmed items | Scheduled, background |
+| 5 | About to generate on topic X | Classify task → `aizo recall --scenario <X> --min-score 3.0` → inject → `aizo apply <used ids>` | Sync recall before generation, apply after |
+| 6 | Historical batch analysis | Agent LLM scans past sessions → `aizo add` new + `aizo apply`/`touch` confirmed | Scheduled, background |
+| 7 | Daily cron job | Agent LLM scans logs → `aizo apply`/`touch` confirmed items | Scheduled, background |
 
 **Key rules encoded in the skill:**
 - Taboos always win over preferences in conflicts
