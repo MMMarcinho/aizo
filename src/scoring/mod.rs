@@ -52,14 +52,13 @@ pub fn compute(base_score: f64, last_seen: &str, cfg: &DecayConfig) -> ScoringRe
 /// d(t) = φ + (1 − φ) · exp(−λt),  λ = ln2 / t½
 pub fn decay_coefficient(last_seen: &str, cfg: &DecayConfig) -> f64 {
     let Ok(last) = DateTime::parse_from_rfc3339(last_seen) else {
-        eprintln!("aizo: warning: unparseable last_seen {:?}, treating as now", last_seen);
+        eprintln!(
+            "aizo: warning: unparseable last_seen {:?}, treating as now",
+            last_seen
+        );
         return 1.0;
     };
-    let days = Utc::now()
-        .signed_duration_since(last)
-        .num_seconds()
-        .max(0) as f64
-        / 86_400.0;
+    let days = Utc::now().signed_duration_since(last).num_seconds().max(0) as f64 / 86_400.0;
     let lambda = std::f64::consts::LN_2 / cfg.half_life_days;
     let raw = (-lambda * days).exp();
     cfg.floor + (1.0 - cfg.floor) * raw
@@ -78,7 +77,10 @@ mod tests {
     use super::*;
 
     fn cfg() -> DecayConfig {
-        DecayConfig { half_life_days: 30.0, floor: 0.1 }
+        DecayConfig {
+            half_life_days: 30.0,
+            floor: 0.1,
+        }
     }
 
     #[test]
@@ -99,7 +101,11 @@ mod tests {
     fn decay_approaches_floor() {
         let ancient = "2000-01-01T00:00:00+00:00";
         let d = decay_coefficient(ancient, &cfg());
-        assert!((d - cfg().floor).abs() < 0.001, "d(∞) should be ~floor={}, got {d}", cfg().floor);
+        assert!(
+            (d - cfg().floor).abs() < 0.001,
+            "d(∞) should be ~floor={}, got {d}",
+            cfg().floor
+        );
     }
 
     #[test]
