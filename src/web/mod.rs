@@ -29,7 +29,11 @@ impl From<anyhow::Error> for AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (axum::http::StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()).into_response()
+        (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            self.0.to_string(),
+        )
+            .into_response()
     }
 }
 
@@ -109,14 +113,12 @@ async fn preferences_handler(
 
     // Sort
     match params.sort.as_deref() {
-        Some("name") => prefs.sort_by(|a, b| a.item.to_lowercase().cmp(&b.item.to_lowercase())),
+        Some("name") => prefs.sort_by_key(|a| a.item.to_lowercase()),
         Some("base_score") => {
             prefs.sort_by(|a, b| b.base_score.partial_cmp(&a.base_score).unwrap())
         }
         Some("recency") => prefs.sort_by(|a, b| b.last_seen.cmp(&a.last_seen)),
-        _ => {
-            prefs.sort_by(|a, b| b.effective_weight.partial_cmp(&a.effective_weight).unwrap())
-        }
+        _ => prefs.sort_by(|a, b| b.effective_weight.partial_cmp(&a.effective_weight).unwrap()),
     }
 
     if params.order.as_deref() == Some("asc") {

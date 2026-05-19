@@ -12,16 +12,16 @@ pub struct Preference {
     pub id: i64,
     pub item: String,
     pub reason: String,
-    pub keywords: Vec<String>,  // synonym/related-term tags for richer recall
+    pub keywords: Vec<String>, // synonym/related-term tags for richer recall
     pub scenarios: Vec<String>, // task scenarios this entry applies to
-    pub base_score: f64,        // 0–10: 0 = hard limit, 10 = strong love
-    pub source: String,         // "analysis" | "manual"
+    pub base_score: f64,       // 0–10: 0 = hard limit, 10 = strong love
+    pub source: String,        // "analysis" | "manual"
     pub added_at: String,
-    pub last_seen: String,      // reset on every reinforcement; drives decay clock
-    pub touch_count: i64,       // number of times this entry has been touched
-    pub score_exponent: f64,    // α = (10 − s) / 10
+    pub last_seen: String,   // reset on every reinforcement; drives decay clock
+    pub touch_count: i64,    // number of times this entry has been touched
+    pub score_exponent: f64, // α = (10 − s) / 10
     pub decay_coefficient: f64, // d(t) ∈ [floor, 1.0]
-    pub effective_weight: f64,  // w = s · d(t)^α
+    pub effective_weight: f64, // w = s · d(t)^α
 }
 
 pub struct Db {
@@ -62,26 +62,31 @@ impl Db {
     }
 
     fn migrate(&self) -> Result<()> {
-        self.conn.execute_batch("
+        self.conn.execute_batch(
+            "
             PRAGMA journal_mode=WAL;
             CREATE TABLE IF NOT EXISTS schema_meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
-        ")?;
+        ",
+        )?;
 
         let version = self.schema_version();
 
         if version < 2 {
-            self.conn.execute_batch("
+            self.conn.execute_batch(
+                "
                 DROP TABLE IF EXISTS preferences;
                 DROP TABLE IF EXISTS sessions;
                 DROP TABLE IF EXISTS decay_config;
-            ")?;
+            ",
+            )?;
         }
 
         // Ensure supporting tables always exist
-        self.conn.execute_batch("
+        self.conn.execute_batch(
+            "
             CREATE TABLE IF NOT EXISTS decay_config (
                 id              INTEGER PRIMARY KEY CHECK(id = 1),
                 half_life_days  REAL    NOT NULL DEFAULT 30.0,
@@ -89,13 +94,15 @@ impl Db {
             );
             INSERT OR IGNORE INTO decay_config (id, half_life_days, floor)
                 VALUES (1, 30.0, 0.1);
-        ")?;
+        ",
+        )?;
 
         if version < 5 {
             // Rebuild preferences table: drop category, unique on LOWER(item) only.
             // For any duplicate items (same item under different old categories),
             // keep the row whose base_score is furthest from neutral (5.0).
-            self.conn.execute_batch("
+            self.conn.execute_batch(
+                "
                 CREATE TABLE IF NOT EXISTS preferences_v5 (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     item        TEXT    NOT NULL,
@@ -108,21 +115,25 @@ impl Db {
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_pref_item_v5
                     ON preferences_v5(LOWER(item));
-            ")?;
+            ",
+            )?;
 
             // Copy from old table if it exists (versions 2–4 had category column).
-            let old_exists: bool = self.conn
+            let old_exists: bool = self
+                .conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='preferences'",
                     [],
                     |r| r.get::<_, i64>(0),
                 )
-                .unwrap_or(0) > 0;
+                .unwrap_or(0)
+                > 0;
 
             if old_exists {
                 // Order by extremity so INSERT OR IGNORE keeps the most salient entry
                 // when the same item appeared under multiple old categories.
-                self.conn.execute_batch("
+                self.conn.execute_batch(
+                    "
                     INSERT OR IGNORE INTO preferences_v5
                         (item, reason, keywords, base_score, source, added_at, last_seen)
                     SELECT item,
@@ -136,15 +147,19 @@ impl Db {
                     ORDER BY ABS(base_score - 5.0) DESC, last_seen DESC;
 
                     DROP TABLE preferences;
-                ")?;
+                ",
+                )?;
             }
 
-            self.conn.execute_batch("
+            self.conn.execute_batch(
+                "
                 ALTER TABLE preferences_v5 RENAME TO preferences;
-            ")?;
+            ",
+            )?;
         } else {
             // Fresh database at v5+: create the table directly
-            self.conn.execute_batch("
+            self.conn.execute_batch(
+                "
                 CREATE TABLE IF NOT EXISTS preferences (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     item        TEXT    NOT NULL,
@@ -157,13 +172,15 @@ impl Db {
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_pref_item
                     ON preferences(LOWER(item));
-            ")?;
+            ",
+            )?;
         }
 
         self.set_version(5)?;
 
         if version < 6 {
-            self.conn.execute_batch("
+            self.conn.execute_batch(
+                "
                 CREATE TABLE IF NOT EXISTS preference_scenarios (
                     preference_id INTEGER NOT NULL,
                     scenario TEXT NOT NULL,
@@ -172,15 +189,18 @@ impl Db {
                 );
                 CREATE INDEX IF NOT EXISTS idx_preference_scenarios_scenario
                     ON preference_scenarios(scenario);
-            ")?;
+            ",
+            )?;
         }
 
         self.set_version(6)?;
 
         if version < 7 {
-            self.conn.execute_batch("
+            self.conn.execute_batch(
+                "
                 ALTER TABLE preferences ADD COLUMN touch_count INTEGER NOT NULL DEFAULT 0;
-            ")?;
+            ",
+            )?;
         }
 
         self.set_version(7)?;
@@ -191,13 +211,14 @@ impl Db {
 
     /// Backfill scenario associations from existing keyword data.
     /// Idempotent: uses INSERT OR IGNORE so repeated calls are safe.
-    pub fn backfill_scenarios(&self, scenario_config: &HashMap<String, (String, Vec<String>)>) -> Result<usize> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, keywords FROM preferences",
-        )?;
-        let rows: Vec<(i64, String)> = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?.collect::<rusqlite::Result<_>>()?;
+    pub fn backfill_scenarios(
+        &self,
+        scenario_config: &HashMap<String, (String, Vec<String>)>,
+    ) -> Result<usize> {
+        let mut stmt = self.conn.prepare("SELECT id, keywords FROM preferences")?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
 
         let mut insert = self.conn.prepare(
             "INSERT OR IGNORE INTO preference_scenarios (preference_id, scenario) VALUES (?1, ?2)",
@@ -215,12 +236,15 @@ impl Db {
             }
 
             for (scenario_name, (_, scenario_kws)) in scenario_config {
-                let hits = kws.iter().filter(|kw| scenario_kws.iter().any(|sk| sk == **kw)).count();
+                let hits = kws
+                    .iter()
+                    .filter(|kw| scenario_kws.iter().any(|sk| sk == **kw))
+                    .count();
                 // High-confidence: at least 2 keyword matches, or the scenario name itself appears as a keyword
-                let direct = kws.iter().any(|kw| *kw == scenario_name.as_str());
+                let direct = kws.contains(&scenario_name.as_str());
                 if hits >= 2 || direct {
                     let n = insert.execute(params![id, scenario_name])?;
-                    total += n as usize;
+                    total += n;
                 }
             }
         }
@@ -232,7 +256,12 @@ impl Db {
             .query_row(
                 "SELECT half_life_days, floor FROM decay_config WHERE id = 1",
                 [],
-                |row| Ok(DecayConfig { half_life_days: row.get(0)?, floor: row.get(1)? }),
+                |row| {
+                    Ok(DecayConfig {
+                        half_life_days: row.get(0)?,
+                        floor: row.get(1)?,
+                    })
+                },
             )
             .map_err(Into::into)
     }
@@ -257,24 +286,24 @@ impl Db {
         let s = scoring::compute(base_score, &last_seen, cfg);
 
         Ok(Preference {
-            id:                row.get(0)?,
-            item:              row.get(1)?,
-            reason:            row.get(2)?,
+            id: row.get(0)?,
+            item: row.get(1)?,
+            reason: row.get(2)?,
             keywords: keywords_raw
                 .split(',')
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(String::from)
                 .collect(),
-            scenarios:         Vec::new(), // filled by load_scenarios_for
+            scenarios: Vec::new(), // filled by load_scenarios_for
             base_score,
-            source:            row.get(5)?,
-            added_at:          row.get(6)?,
+            source: row.get(5)?,
+            added_at: row.get(6)?,
             last_seen,
-            touch_count:       row.get(8)?,
-            score_exponent:    s.score_exponent,
+            touch_count: row.get(8)?,
+            score_exponent: s.score_exponent,
             decay_coefficient: s.decay_coefficient,
-            effective_weight:  s.effective_weight,
+            effective_weight: s.effective_weight,
         })
     }
 
@@ -283,14 +312,17 @@ impl Db {
         if prefs.is_empty() {
             return Ok(());
         }
-        let placeholders: Vec<String> = prefs.iter().enumerate()
+        let placeholders: Vec<String> = prefs
+            .iter()
+            .enumerate()
             .map(|(i, _)| format!("?{}", i + 1))
             .collect();
         let sql = format!(
             "SELECT preference_id, scenario FROM preference_scenarios WHERE preference_id IN ({}) ORDER BY preference_id, scenario",
             placeholders.join(", ")
         );
-        let ids: Vec<rusqlite::types::Value> = prefs.iter()
+        let ids: Vec<rusqlite::types::Value> = prefs
+            .iter()
             .map(|p| rusqlite::types::Value::Integer(p.id))
             .collect();
 
@@ -368,7 +400,9 @@ impl Db {
             return Ok(());
         }
         let now = Utc::now().to_rfc3339();
-        let placeholders = ids.iter().enumerate()
+        let placeholders = ids
+            .iter()
+            .enumerate()
             .map(|(i, _)| format!("?{}", i + 2))
             .collect::<Vec<_>>()
             .join(", ");
@@ -419,22 +453,28 @@ impl Db {
             .iter()
             .map(|(name, (desc, kws))| {
                 let entries = counts.get(name).copied().unwrap_or(0);
-                (name.clone(), ScenarioStats {
-                    entries,
-                    keywords: kws.len(),
-                    description: desc.clone(),
-                })
+                (
+                    name.clone(),
+                    ScenarioStats {
+                        entries,
+                        keywords: kws.len(),
+                        description: desc.clone(),
+                    },
+                )
             })
             .collect();
 
         // Add any scenarios in DB but not in config
         for (name, entries) in &counts {
             if !config.contains_key(name) {
-                result.push((name.clone(), ScenarioStats {
-                    entries: *entries,
-                    keywords: 0,
-                    description: String::new(),
-                }));
+                result.push((
+                    name.clone(),
+                    ScenarioStats {
+                        entries: *entries,
+                        keywords: 0,
+                        description: String::new(),
+                    },
+                ));
             }
         }
 
@@ -444,10 +484,11 @@ impl Db {
 
     /// Return all keywords with their entry counts.
     pub fn all_keywords(&self) -> Result<Vec<(String, usize)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT keywords FROM preferences WHERE keywords != ''",
-        )?;
-        let rows: Vec<String> = stmt.query_map([], |r| r.get(0))?
+        let mut stmt = self
+            .conn
+            .prepare("SELECT keywords FROM preferences WHERE keywords != ''")?;
+        let rows: Vec<String> = stmt
+            .query_map([], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
 
         let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
@@ -460,8 +501,7 @@ impl Db {
     }
 
     pub fn clear(&self) -> Result<()> {
-        self.conn
-            .execute_batch("DELETE FROM preferences;")?;
+        self.conn.execute_batch("DELETE FROM preferences;")?;
         Ok(())
     }
 
@@ -476,11 +516,14 @@ impl Db {
         keywords: Option<&[String]>,
         scenarios: Option<&[String]>,
     ) -> Result<bool> {
-        let pref_id: Option<i64> = self.conn.query_row(
-            "SELECT id FROM preferences WHERE LOWER(item) = LOWER(?1)",
-            params![item],
-            |r| r.get(0),
-        ).ok();
+        let pref_id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM preferences WHERE LOWER(item) = LOWER(?1)",
+                params![item],
+                |r| r.get(0),
+            )
+            .ok();
 
         let Some(pref_id) = pref_id else {
             return Ok(false);
@@ -501,6 +544,9 @@ impl Db {
         }
 
         if let Some(s) = score {
+            if !(0.0..=10.0).contains(&s) {
+                anyhow::bail!("score must be between 0.0 and 10.0, got {s}");
+            }
             self.conn.execute(
                 "UPDATE preferences SET base_score = ?1 WHERE id = ?2",
                 params![s, pref_id],
@@ -508,7 +554,11 @@ impl Db {
         }
 
         if let Some(kws) = keywords {
-            let kw = kws.iter().map(|k| k.to_lowercase()).collect::<Vec<_>>().join(", ");
+            let kw = kws
+                .iter()
+                .map(|k| k.to_lowercase())
+                .collect::<Vec<_>>()
+                .join(", ");
             self.conn.execute(
                 "UPDATE preferences SET keywords = ?1 WHERE id = ?2",
                 params![kw, pref_id],
@@ -598,12 +648,16 @@ impl Db {
 
         // Score range filter: multiple ranges are OR'd together
         if !score_ranges.is_empty() {
-            let range_parts: Vec<String> = score_ranges.iter().map(|(min, max)| {
-                let i = p; p += 2;
-                bind_vals.push(rusqlite::types::Value::Real(*min));
-                bind_vals.push(rusqlite::types::Value::Real(*max));
-                format!("(base_score >= ?{i} AND base_score <= ?{})", i + 1)
-            }).collect();
+            let range_parts: Vec<String> = score_ranges
+                .iter()
+                .map(|(min, max)| {
+                    let i = p;
+                    p += 2;
+                    bind_vals.push(rusqlite::types::Value::Real(*min));
+                    bind_vals.push(rusqlite::types::Value::Real(*max));
+                    format!("(base_score >= ?{i} AND base_score <= ?{})", i + 1)
+                })
+                .collect();
             where_clauses.push(format!("({})", range_parts.join(" OR ")));
         }
 
@@ -623,7 +677,9 @@ impl Db {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let mut rows: Vec<Preference> = stmt
-            .query_map(rusqlite::params_from_iter(bind_vals), |row| Self::hydrate(row, &cfg))?
+            .query_map(rusqlite::params_from_iter(bind_vals), |row| {
+                Self::hydrate(row, &cfg)
+            })?
             .collect::<rusqlite::Result<_>>()?;
 
         self.load_scenarios_for(&mut rows)?;
@@ -639,22 +695,23 @@ impl Db {
     }
 
     pub fn stats(&self) -> Result<Stats> {
-        let count = |sql: &str| -> rusqlite::Result<usize> {
-            self.conn.query_row(sql, [], |r| r.get(0))
-        };
+        let count =
+            |sql: &str| -> rusqlite::Result<usize> { self.conn.query_row(sql, [], |r| r.get(0)) };
         Ok(Stats {
-            high:   count("SELECT COUNT(*) FROM preferences WHERE base_score >= 7.0")?,
-            mid:    count("SELECT COUNT(*) FROM preferences WHERE base_score > 3.0 AND base_score < 7.0")?,
-            low:    count("SELECT COUNT(*) FROM preferences WHERE base_score <= 3.0")?,
+            high: count("SELECT COUNT(*) FROM preferences WHERE base_score >= 7.0")?,
+            mid: count(
+                "SELECT COUNT(*) FROM preferences WHERE base_score > 3.0 AND base_score < 7.0",
+            )?,
+            low: count("SELECT COUNT(*) FROM preferences WHERE base_score <= 3.0")?,
         })
     }
 }
 
 #[derive(Debug)]
 pub struct Stats {
-    pub high: usize,      // score ≥ 7: strong likes
-    pub mid: usize,       // score 4–6: neutral habits
-    pub low: usize,       // score ≤ 3: dislikes / limits
+    pub high: usize, // score ≥ 7: strong likes
+    pub mid: usize,  // score 4–6: neutral habits
+    pub low: usize,  // score ≤ 3: dislikes / limits
 }
 
 #[derive(Debug, Serialize)]
@@ -667,5 +724,48 @@ pub struct ScenarioStats {
 impl Stats {
     pub fn total(&self) -> usize {
         self.high + self.mid + self.low
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let unique = Utc::now()
+            .timestamp_nanos_opt()
+            .expect("current timestamp should fit in nanoseconds");
+        std::env::temp_dir().join(format!("aizo-{name}-{}-{unique}.db", std::process::id()))
+    }
+
+    #[test]
+    fn update_rejects_out_of_range_score() -> Result<()> {
+        let path = temp_db_path("invalid-score");
+        let db = Db::open(&path)?;
+
+        db.upsert(
+            "concise code",
+            "Prefers short implementations",
+            &[],
+            &[],
+            9.0,
+            "manual",
+        )?;
+
+        let err = db
+            .update("concise code", None, None, Some(999.0), None, None)
+            .expect_err("invalid score should fail");
+        assert!(err.to_string().contains("score must be between"));
+
+        let prefs = db.all()?;
+        assert_eq!(prefs.len(), 1);
+        assert_eq!(prefs[0].base_score, 9.0);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+
+        Ok(())
     }
 }

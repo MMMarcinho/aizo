@@ -195,21 +195,39 @@ fn load_taxonomy() -> Option<Vec<String>> {
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
         .map(String::from)
         .collect();
-    if terms.is_empty() { None } else { Some(terms) }
+    if terms.is_empty() {
+        None
+    } else {
+        Some(terms)
+    }
 }
 
 fn score_label(score: f64) -> &'static str {
-    if score >= 7.0 { "liked" } else if score <= 3.0 { "disliked" } else { "neutral" }
+    if score >= 7.0 {
+        "liked"
+    } else if score <= 3.0 {
+        "disliked"
+    } else {
+        "neutral"
+    }
+}
+
+fn validate_score(score: f64) -> Result<f64> {
+    if (0.0..=10.0).contains(&score) {
+        Ok(score)
+    } else {
+        anyhow::bail!("--score must be between 0.0 and 10.0, got {score}");
+    }
 }
 
 /// Map a score-band name to a (min, max) base_score range (inclusive).
 pub(crate) fn parse_score_band(t: &str) -> Result<(f64, f64)> {
     match t.trim() {
         "preference" | "pref" | "like" | "love" => Ok((7.0, 10.0)),
-        "style"                                  => Ok((6.5, 10.0)),
-        "habit"  | "neutral"                     => Ok((4.0, 7.0)),
-        "aversion" | "avers" | "dislike" | "hate"=> Ok((1.5, 4.0)),
-        "taboo"  | "limit"  | "hard"             => Ok((0.0, 1.5)),
+        "style" => Ok((6.5, 10.0)),
+        "habit" | "neutral" => Ok((4.0, 7.0)),
+        "aversion" | "avers" | "dislike" | "hate" => Ok((1.5, 4.0)),
+        "taboo" | "limit" | "hard" => Ok((0.0, 1.5)),
         other => anyhow::bail!(
             "unknown score band '{other}'. Use: preference, style, habit, aversion, taboo"
         ),
@@ -285,10 +303,10 @@ scenarios:
         std::fs::write(&path, default_yaml)?;
     }
 
-    let content = std::fs::read_to_string(&path)
-        .with_context(|| format!("reading {}", path.display()))?;
-    let config: ScenarioConfig = serde_yaml::from_str(&content)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let content =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let config: ScenarioConfig =
+        serde_yaml::from_str(&content).with_context(|| format!("parsing {}", path.display()))?;
 
     for name in config.scenarios.keys() {
         if config.scenarios[name].keywords.is_empty() {
@@ -310,8 +328,12 @@ fn resolve_scenario<'a>(name: &'a str, config: &'a ScenarioConfig) -> Option<&'a
     match name {
         "code" | "dev" | "development" if config.scenarios.contains_key("coding") => Some("coding"),
         "docs" | "documentation" if config.scenarios.contains_key("writing") => Some("writing"),
-        "chat" | "social" | "meeting" if config.scenarios.contains_key("communication") => Some("communication"),
-        "biz" | "business" | "product" if config.scenarios.contains_key("biz-analyze") => Some("biz-analyze"),
+        "chat" | "social" | "meeting" if config.scenarios.contains_key("communication") => {
+            Some("communication")
+        }
+        "biz" | "business" | "product" if config.scenarios.contains_key("biz-analyze") => {
+            Some("biz-analyze")
+        }
         _ => None,
     }
 }
@@ -329,8 +351,8 @@ fn scenario_recall(
         .map(|c| c.to_string())
         .unwrap_or_else(|| scenario.to_string());
 
-    // 1. Exact scenario matches via JOIN
-    let mut exact = db.recall(&[], ranges, Some(&canonical), None, touch)?;
+    // 1. Exact scenario matches via JOIN. Touch once after merge/dedupe below.
+    let mut exact = db.recall(&[], ranges, Some(&canonical), None, false)?;
 
     // 2. Keyword expansion from scenario config
     let mut expanded = if let Some(def) = config.scenarios.get(&canonical) {
@@ -350,7 +372,9 @@ fn scenario_recall(
     }
     // Re-sort by effective_weight
     merged.sort_by(|a, b| b.effective_weight.partial_cmp(&a.effective_weight).unwrap());
-    if let Some(n) = limit { merged.truncate(n); }
+    if let Some(n) = limit {
+        merged.truncate(n);
+    }
     if touch {
         for p in &merged {
             let _ = db.touch(&p.item);
@@ -366,23 +390,40 @@ fn print_entries(entries: &[Preference], json: bool) {
     }
 
     let high = entries.iter().filter(|e| e.base_score >= 7.0).count();
-    let low  = entries.iter().filter(|e| e.base_score <= 3.0).count();
-    let mid  = entries.len() - high - low;
+    let low = entries.iter().filter(|e| e.base_score <= 3.0).count();
+    let mid = entries.len() - high - low;
 
     let mut parts = Vec::new();
-    if high > 0 { parts.push(format!("{high} liked")); }
-    if mid  > 0 { parts.push(format!("{mid} neutral")); }
-    if low  > 0 { parts.push(format!("{low} disliked")); }
+    if high > 0 {
+        parts.push(format!("{high} liked"));
+    }
+    if mid > 0 {
+        parts.push(format!("{mid} neutral"));
+    }
+    if low > 0 {
+        parts.push(format!("{low} disliked"));
+    }
     println!("{} entries  ({})", entries.len(), parts.join(" · "));
     println!();
 
     for e in entries {
         let extras: Vec<String> = std::iter::empty()
-            .chain(e.scenarios.iter().map(|s| s.clone()))
-            .chain(if e.touch_count > 0 { Some(format!("t:{}", e.touch_count)) } else { None })
+            .chain(e.scenarios.iter().cloned())
+            .chain(if e.touch_count > 0 {
+                Some(format!("t:{}", e.touch_count))
+            } else {
+                None
+            })
             .collect();
-        let tag = if extras.is_empty() { String::new() } else { format!("  [{}]", extras.join("] [")) };
-        println!("  {:<28}  {:>4.1}   {}{}", e.item, e.effective_weight, e.reason, tag);
+        let tag = if extras.is_empty() {
+            String::new()
+        } else {
+            format!("  [{}]", extras.join("] ["))
+        };
+        println!(
+            "  {:<28}  {:>4.1}   {}{}",
+            e.item, e.effective_weight, e.reason, tag
+        );
     }
 }
 
@@ -405,11 +446,15 @@ fn main() -> Result<()> {
     // Backfill scenario associations from existing keywords (idempotent)
     {
         if let Ok(sc_config) = load_scenario_config() {
-            let config_map: HashMap<String, (String, Vec<String>)> = sc_config.scenarios.iter()
+            let config_map: HashMap<String, (String, Vec<String>)> = sc_config
+                .scenarios
+                .iter()
                 .map(|(k, v)| (k.clone(), (v.description.clone(), v.keywords.clone())))
                 .collect();
             match db.backfill_scenarios(&config_map) {
-                Ok(n) if n > 0 => eprintln!("Backfilled {n} scenario associations from existing keywords."),
+                Ok(n) if n > 0 => {
+                    eprintln!("Backfilled {n} scenario associations from existing keywords.")
+                }
                 Err(e) => eprintln!("Note: scenario backfill skipped ({e})"),
                 _ => {}
             }
@@ -434,8 +479,14 @@ fn main() -> Result<()> {
                     Some(terms) => {
                         let term_set: std::collections::HashSet<&str> =
                             terms.iter().map(String::as_str).collect();
-                        let active_count = kws.iter().filter(|(k, _)| term_set.contains(k.as_str())).count();
-                        println!("Taxonomy coverage: {active_count} / {} terms active\n", terms.len());
+                        let active_count = kws
+                            .iter()
+                            .filter(|(k, _)| term_set.contains(k.as_str()))
+                            .count();
+                        println!(
+                            "Taxonomy coverage: {active_count} / {} terms active\n",
+                            terms.len()
+                        );
 
                         println!("  {:<28}  entries", "keyword");
                         println!("  {}", "─".repeat(40));
@@ -447,7 +498,10 @@ fn main() -> Result<()> {
                                 println!("  {:<28}  —", term);
                             }
                         }
-                        let extras: Vec<_> = kws.iter().filter(|(k, _)| !term_set.contains(k.as_str())).collect();
+                        let extras: Vec<_> = kws
+                            .iter()
+                            .filter(|(k, _)| !term_set.contains(k.as_str()))
+                            .collect();
                         if !extras.is_empty() {
                             println!("\n  [not in taxonomy]");
                             for (kw, n) in &extras {
@@ -468,27 +522,46 @@ fn main() -> Result<()> {
 
         Command::Scenarios => {
             let config = load_scenario_config()?;
-            let config_map: HashMap<String, (String, Vec<String>)> = config.scenarios.iter()
+            let config_map: HashMap<String, (String, Vec<String>)> = config
+                .scenarios
+                .iter()
                 .map(|(k, v)| (k.clone(), (v.description.clone(), v.keywords.clone())))
                 .collect();
             let scenarios = db.all_scenarios(&config_map)?;
             if scenarios.is_empty() {
                 println!("No scenarios configured.");
             } else {
-                println!("  {:<20}  {:>7}  {:>8}  {}", "scenario", "entries", "keywords", "description");
+                println!(
+                    "  {:<20}  {:>7}  {:>8}  description",
+                    "scenario", "entries", "keywords"
+                );
                 println!("  {}", "─".repeat(80));
                 for (name, stats) in &scenarios {
-                    println!("  {:<20}  {:>7}  {:>8}  {}",
-                        name, stats.entries, stats.keywords, stats.description);
+                    println!(
+                        "  {:<20}  {:>7}  {:>8}  {}",
+                        name, stats.entries, stats.keywords, stats.description
+                    );
                 }
             }
         }
 
-        Command::Recall { query, score_bands, types, limit, scenario, min_score, no_touch, json } => {
+        Command::Recall {
+            query,
+            score_bands,
+            types,
+            limit,
+            scenario,
+            min_score,
+            no_touch,
+            json,
+        } => {
             // Merge --score-band and deprecated --type
             let mut bands = score_bands;
-            if bands.is_empty() { bands = types; }
-            let mut ranges: Vec<(f64, f64)> = bands.iter()
+            if bands.is_empty() {
+                bands = types;
+            }
+            let mut ranges: Vec<(f64, f64)> = bands
+                .iter()
                 .map(|t| parse_score_band(t))
                 .collect::<Result<_>>()?;
 
@@ -497,7 +570,8 @@ fn main() -> Result<()> {
                 if ranges.is_empty() {
                     ranges.push((min, 10.0));
                 } else {
-                    ranges = ranges.into_iter()
+                    ranges = ranges
+                        .into_iter()
                         .filter(|(_, max)| *max >= min)
                         .map(|(lo, hi)| (lo.max(min), hi))
                         .collect();
@@ -512,21 +586,37 @@ fn main() -> Result<()> {
             };
 
             if prefs.is_empty() {
-                let scope = if bands.is_empty() && min_score.is_none() { String::new() }
-                            else if bands.is_empty() { format!(" [≥{:.1}]", min_score.unwrap()) }
-                            else if let Some(m) = min_score { format!(" [≥{:.1}, {}]", m, bands.join(", ")) }
-                            else { format!(" [{}]", bands.join(", ")) };
-                let what  = query.as_deref().unwrap_or(scenario.as_deref().unwrap_or("*"));
+                let scope = if bands.is_empty() && min_score.is_none() {
+                    String::new()
+                } else if bands.is_empty() {
+                    format!(" [≥{:.1}]", min_score.unwrap())
+                } else if let Some(m) = min_score {
+                    format!(" [≥{:.1}, {}]", m, bands.join(", "))
+                } else {
+                    format!(" [{}]", bands.join(", "))
+                };
+                let what = query
+                    .as_deref()
+                    .unwrap_or(scenario.as_deref().unwrap_or("*"));
                 println!("No preferences matched \"{what}\"{scope}.");
             } else {
                 print_entries(&prefs, json);
             }
         }
 
-        Command::Top { n, score_bands, types, scenario, json } => {
+        Command::Top {
+            n,
+            score_bands,
+            types,
+            scenario,
+            json,
+        } => {
             let mut bands = score_bands;
-            if bands.is_empty() { bands = types; }
-            let ranges: Vec<(f64, f64)> = bands.iter()
+            if bands.is_empty() {
+                bands = types;
+            }
+            let ranges: Vec<(f64, f64)> = bands
+                .iter()
                 .map(|t| parse_score_band(t))
                 .collect::<Result<_>>()?;
 
@@ -540,7 +630,10 @@ fn main() -> Result<()> {
                 println!("No preferences recorded yet.");
             } else {
                 let limited: Vec<&Preference> = prefs.iter().take(n).collect();
-                print_entries(&limited.iter().map(|&p| p.clone()).collect::<Vec<_>>(), json);
+                print_entries(
+                    &limited.iter().map(|&p| p.clone()).collect::<Vec<_>>(),
+                    json,
+                );
             }
         }
 
@@ -553,10 +646,15 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Add { item, reason, score, keywords, scenarios } => {
+        Command::Add {
+            item,
+            reason,
+            score,
+            keywords,
+            scenarios,
+        } => {
             let base_score = match score {
-                Some(s) if (0.0..=10.0).contains(&s) => s,
-                Some(s) => anyhow::bail!("--score must be between 0.0 and 10.0, got {s}"),
+                Some(s) => validate_score(s)?,
                 None => 9.0,
             };
             let kws: Vec<String> = keywords.iter().map(|k| k.to_lowercase()).collect();
@@ -564,21 +662,43 @@ fn main() -> Result<()> {
             db.upsert(&item, &reason, &kws, &scens, base_score, "manual")?;
             let label = score_label(base_score);
             let mut extras = Vec::new();
-            if !kws.is_empty() { extras.push(format!("keywords: {}", kws.join(", "))); }
-            if !scens.is_empty() { extras.push(format!("scenarios: {}", scens.join(", "))); }
+            if !kws.is_empty() {
+                extras.push(format!("keywords: {}", kws.join(", ")));
+            }
+            if !scens.is_empty() {
+                extras.push(format!("scenarios: {}", scens.join(", ")));
+            }
             if extras.is_empty() {
                 println!("Added [{label}]: \"{item}\" (score {base_score:.1})");
             } else {
-                println!("Added [{label}]: \"{item}\" (score {base_score:.1})  {}", extras.join("  "));
+                println!(
+                    "Added [{label}]: \"{item}\" (score {base_score:.1})  {}",
+                    extras.join("  ")
+                );
             }
         }
 
-        Command::Update { item, new_item, reason, score, keywords, scenarios } => {
-            if new_item.is_none() && reason.is_none() && score.is_none() && keywords.is_none() && scenarios.is_none() {
+        Command::Update {
+            item,
+            new_item,
+            reason,
+            score,
+            keywords,
+            scenarios,
+        } => {
+            if new_item.is_none()
+                && reason.is_none()
+                && score.is_none()
+                && keywords.is_none()
+                && scenarios.is_none()
+            {
                 anyhow::bail!("specify at least one field to update: --new-item, --reason, --score, --keywords, --scenarios");
             }
-            let kws: Option<Vec<String>> = keywords.map(|v| v.into_iter().map(|k| k.to_lowercase()).collect());
-            let scens: Option<Vec<String>> = scenarios.map(|v| v.into_iter().map(|s| s.to_lowercase()).collect());
+            let score = score.map(validate_score).transpose()?;
+            let kws: Option<Vec<String>> =
+                keywords.map(|v| v.into_iter().map(|k| k.to_lowercase()).collect());
+            let scens: Option<Vec<String>> =
+                scenarios.map(|v| v.into_iter().map(|s| s.to_lowercase()).collect());
 
             let found = db.update(
                 &item,
@@ -590,11 +710,21 @@ fn main() -> Result<()> {
             )?;
             if found {
                 let mut parts = Vec::new();
-                if let Some(ref ni) = new_item { parts.push(format!("item: {ni}")); }
-                if reason.is_some() { parts.push("reason updated".into()); }
-                if let Some(s) = score { parts.push(format!("score: {s:.1}")); }
-                if let Some(ref k) = kws { parts.push(format!("keywords: {}", k.join(", "))); }
-                if let Some(ref s) = scens { parts.push(format!("scenarios: {}", s.join(", "))); }
+                if let Some(ref ni) = new_item {
+                    parts.push(format!("item: {ni}"));
+                }
+                if reason.is_some() {
+                    parts.push("reason updated".into());
+                }
+                if let Some(s) = score {
+                    parts.push(format!("score: {s:.1}"));
+                }
+                if let Some(ref k) = kws {
+                    parts.push(format!("keywords: {}", k.join(", ")));
+                }
+                if let Some(ref s) = scens {
+                    parts.push(format!("scenarios: {}", s.join(", ")));
+                }
                 if parts.is_empty() {
                     println!("Updated \"{item}\"");
                 } else {
@@ -641,13 +771,34 @@ fn main() -> Result<()> {
             let cfg = db.get_decay_config()?;
             println!("Database    : {}", db_path.display());
             println!("Config");
-            println!("  ~/.aizo/.env : {}", if user_env    { "loaded" } else { "not found" });
-            println!("  ./.env       : {}", if project_env { "loaded" } else { "not found" });
-            println!("  AIZO_MODEL         : {}", std::env::var("AIZO_MODEL").unwrap_or_else(|_| "(not set)".into()));
-            println!("  AIZO_API_URL       : {}", std::env::var("AIZO_API_URL").unwrap_or_else(|_| "(not set)".into()));
-            println!("  AIZO_API_FORMAT    : {}", std::env::var("AIZO_API_FORMAT").unwrap_or_else(|_| "(not set)".into()));
-            println!("  AIZO_AUTO_KEYWORDS : {}", std::env::var("AIZO_AUTO_KEYWORDS").unwrap_or_else(|_| "false (default)".into()));
-            println!("  AIZO_MAX_TOKENS    : {}", std::env::var("AIZO_MAX_TOKENS").unwrap_or_else(|_| "8192 (default)".into()));
+            println!(
+                "  ~/.aizo/.env : {}",
+                if user_env { "loaded" } else { "not found" }
+            );
+            println!(
+                "  ./.env       : {}",
+                if project_env { "loaded" } else { "not found" }
+            );
+            println!(
+                "  AIZO_MODEL         : {}",
+                std::env::var("AIZO_MODEL").unwrap_or_else(|_| "(not set)".into())
+            );
+            println!(
+                "  AIZO_API_URL       : {}",
+                std::env::var("AIZO_API_URL").unwrap_or_else(|_| "(not set)".into())
+            );
+            println!(
+                "  AIZO_API_FORMAT    : {}",
+                std::env::var("AIZO_API_FORMAT").unwrap_or_else(|_| "(not set)".into())
+            );
+            println!(
+                "  AIZO_AUTO_KEYWORDS : {}",
+                std::env::var("AIZO_AUTO_KEYWORDS").unwrap_or_else(|_| "false (default)".into())
+            );
+            println!(
+                "  AIZO_MAX_TOKENS    : {}",
+                std::env::var("AIZO_MAX_TOKENS").unwrap_or_else(|_| "8192 (default)".into())
+            );
             println!("Total       : {}", stats.total());
             println!("  liked     : {} (score ≥ 7)", stats.high);
             println!("  neutral   : {} (score 4–6)", stats.mid);
@@ -681,15 +832,9 @@ fn main() -> Result<()> {
         },
 
         Command::Web { port, no_open } => {
-            let rt = tokio::runtime::Runtime::new()
-                .context("failed to create async runtime")?;
-            rt.block_on(web::serve(
-                db,
-                load_scenario_config()?,
-                port,
-                !no_open,
-            ))?;
-        },
+            let rt = tokio::runtime::Runtime::new().context("failed to create async runtime")?;
+            rt.block_on(web::serve(db, load_scenario_config()?, port, !no_open))?;
+        }
     }
 
     Ok(())
