@@ -1,6 +1,6 @@
 {
   "name": "aizo-node",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "description": "爱憎 — preference memory for AI agents: extract, decay, and recall user likes and dislikes",
   "license": "MIT",
   "repository": {
