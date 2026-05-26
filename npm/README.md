@@ -244,9 +244,16 @@ aizo update "verbose comments" --scenarios coding,writing
 aizo config set-half-life 14
 aizo config set-floor 0.05
 
+# Optional length observability (does not affect effective_weight yet)
+aizo config set-token-counting true
+
 # Stats
 aizo info
 ```
+
+`set-token-counting true` stores an estimated `token_count` for each memory and
+backfills existing rows. The estimate is observational only: it is returned in JSON
+and shown in the web inspector, but it is not part of the weight formula.
 
 ---
 
@@ -262,6 +269,8 @@ aizo info
   "source": "analysis",
   "added_at": "2026-05-07T14:00:00+00:00",
   "last_seen": "2026-05-07T15:30:00+00:00",
+  "touch_count": 2,
+  "token_count": 18,
   "score_exponent": 0.1,
   "decay_coefficient": 0.87,
   "effective_weight": 7.83
@@ -282,14 +291,16 @@ CREATE TABLE preferences (
     source      TEXT    NOT NULL DEFAULT 'manual',
     added_at    TEXT    NOT NULL,
     last_seen   TEXT    NOT NULL,               -- resets decay clock on each reinforcement
-    touch_count INTEGER NOT NULL DEFAULT 0
+    touch_count INTEGER NOT NULL DEFAULT 0,
+    token_count INTEGER NOT NULL DEFAULT 0       -- estimated length, observational only
 );
 -- UNIQUE on LOWER(item)
 
 CREATE TABLE decay_config (
     id              INTEGER PRIMARY KEY CHECK(id = 1),
     half_life_days  REAL    NOT NULL DEFAULT 30.0,
-    floor           REAL    NOT NULL DEFAULT 0.1
+    floor           REAL    NOT NULL DEFAULT 0.1,
+    token_counting_enabled INTEGER NOT NULL DEFAULT 0
 );
 ```
 

@@ -1046,7 +1046,8 @@ function renderInspector() {
     ['score', pref.base_score.toFixed(1)],
     ['weight', pref.effective_weight.toFixed(2)],
     ['decay', pref.decay_coefficient.toFixed(3)],
-    ['touch', pref.touch_count]
+    ['touch', pref.touch_count],
+    ['tokens', pref.token_count ?? 0]
   ].map(([label, value]) => `
     <div class="metric"><span>${label}</span><strong>${value}</strong></div>
   `).join('');

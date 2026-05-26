@@ -238,9 +238,15 @@ aizo update "冗长注释" --scenarios coding,writing
 aizo config set-half-life 14
 aizo config set-floor 0.05
 
+# 可选的长度观测（暂不影响 effective_weight）
+aizo config set-token-counting true
+
 # 查看统计
 aizo info
 ```
+
+`set-token-counting true` 会为每条记忆写入估算的 `token_count`，并回填已有数据。
+这个字段目前只用于观测：会出现在 JSON 和 Web 详情面板中，但不会进入权重公式。
 
 ---
 
@@ -257,6 +263,8 @@ aizo info
   "source": "manual",
   "added_at": "2026-05-07T14:00:00+00:00",
   "last_seen": "2026-05-07T15:30:00+00:00",
+  "touch_count": 2,
+  "token_count": 18,
   "score_exponent": 0.1,
   "decay_coefficient": 0.87,
   "effective_weight": 8.78
@@ -276,14 +284,17 @@ CREATE TABLE preferences (
     base_score  REAL    NOT NULL DEFAULT 5.0,   -- 0-10
     source      TEXT    NOT NULL DEFAULT 'manual',
     added_at    TEXT    NOT NULL,
-    last_seen   TEXT    NOT NULL                -- 每次强化时重置衰减时钟
+    last_seen   TEXT    NOT NULL,               -- 每次强化时重置衰减时钟
+    touch_count INTEGER NOT NULL DEFAULT 0,
+    token_count INTEGER NOT NULL DEFAULT 0       -- 估算长度，仅用于观测
 );
 -- UNIQUE 约束：LOWER(item)
 
 CREATE TABLE decay_config (
     id              INTEGER PRIMARY KEY CHECK(id = 1),
     half_life_days  REAL    NOT NULL DEFAULT 30.0,
-    floor           REAL    NOT NULL DEFAULT 0.1
+    floor           REAL    NOT NULL DEFAULT 0.1,
+    token_counting_enabled INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE preference_scenarios (
