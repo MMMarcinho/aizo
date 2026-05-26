@@ -35,6 +35,7 @@ pub struct Preference {
     pub added_at: String,
     pub last_seen: String,   // reset on every reinforcement; drives decay clock
     pub touch_count: i64,    // number of times this entry has been touched
+    pub token_count: i64,    // estimated token length, only maintained when enabled
     pub score_exponent: f64, // α = (10 − s) / 10
     pub decay_coefficient: f64, // d(t) ∈ [floor, 1.0]
     pub effective_weight: f64, // w = s · d(t)^α
@@ -42,6 +43,59 @@ pub struct Preference {
 
 pub struct Db {
     conn: Connection,
+}
+
+fn parse_keywords(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+pub(crate) fn estimate_token_count(item: &str, reason: &str, keywords: &[String]) -> i64 {
+    let mut tokens = 0i64;
+    let mut ascii_run = 0usize;
+
+    let flush_ascii = |run: &mut usize, tokens: &mut i64| {
+        if *run > 0 {
+            *tokens += (*run).div_ceil(4) as i64;
+            *run = 0;
+        }
+    };
+
+    for ch in item
+        .chars()
+        .chain(std::iter::once(' '))
+        .chain(reason.chars())
+        .chain(std::iter::once(' '))
+        .chain(keywords.join(" ").chars())
+    {
+        if ch.is_ascii_alphanumeric() {
+            ascii_run += 1;
+        } else {
+            flush_ascii(&mut ascii_run, &mut tokens);
+            if is_cjk(ch) || (!ch.is_ascii() && !ch.is_whitespace()) {
+                tokens += 1;
+            }
+        }
+    }
+    flush_ascii(&mut ascii_run, &mut tokens);
+    tokens
+}
+
+fn is_cjk(ch: char) -> bool {
+    matches!(
+        ch as u32,
+        0x3400..=0x4dbf
+            | 0x4e00..=0x9fff
+            | 0xf900..=0xfaff
+            | 0x20000..=0x2a6df
+            | 0x2a700..=0x2b73f
+            | 0x2b740..=0x2b81f
+            | 0x2b820..=0x2ceaf
+            | 0x30000..=0x3134f
+    )
 }
 
 impl Db {
@@ -88,7 +142,7 @@ impl Db {
         ",
         )?;
 
-        let version = self.schema_version();
+        let mut version = self.schema_version();
 
         if version < 2 {
             self.conn.execute_batch(
@@ -192,7 +246,10 @@ impl Db {
             )?;
         }
 
-        self.set_version(5)?;
+        if version < 5 {
+            self.set_version(5)?;
+            version = 5;
+        }
 
         if version < 6 {
             self.conn.execute_batch(
@@ -209,7 +266,10 @@ impl Db {
             )?;
         }
 
-        self.set_version(6)?;
+        if version < 6 {
+            self.set_version(6)?;
+            version = 6;
+        }
 
         if version < 7 {
             self.conn.execute_batch(
@@ -219,8 +279,37 @@ impl Db {
             )?;
         }
 
-        self.set_version(7)?;
+        if version < 7 {
+            self.set_version(7)?;
+            version = 7;
+        }
+
+        if version < 8 {
+            if !self.column_exists("preferences", "token_count")? {
+                self.conn.execute_batch(
+                    "
+                    ALTER TABLE preferences ADD COLUMN token_count INTEGER NOT NULL DEFAULT 0;
+                ",
+                )?;
+            }
+            if !self.column_exists("decay_config", "token_counting_enabled")? {
+                self.conn.execute_batch(
+                    "
+                    ALTER TABLE decay_config ADD COLUMN token_counting_enabled INTEGER NOT NULL DEFAULT 0;
+                ",
+                )?;
+            }
+            self.set_version(8)?;
+        }
         Ok(())
+    }
+
+    fn column_exists(&self, table: &str, column: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get(1))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(cols.iter().any(|name| name == column))
     }
 
     // ── Scenario backfill ──────────────────────────────────────────────────────
@@ -270,12 +359,13 @@ impl Db {
     pub fn get_decay_config(&self) -> Result<DecayConfig> {
         self.conn
             .query_row(
-                "SELECT half_life_days, floor FROM decay_config WHERE id = 1",
+                "SELECT half_life_days, floor, token_counting_enabled FROM decay_config WHERE id = 1",
                 [],
                 |row| {
                     Ok(DecayConfig {
                         half_life_days: row.get(0)?,
                         floor: row.get(1)?,
+                        token_counting_enabled: row.get::<_, i64>(2)? != 0,
                     })
                 },
             )
@@ -290,10 +380,44 @@ impl Db {
         Ok(())
     }
 
+    pub fn set_token_counting_enabled(&self, enabled: bool) -> Result<usize> {
+        self.conn.execute(
+            "UPDATE decay_config SET token_counting_enabled = ?1 WHERE id = 1",
+            params![if enabled { 1 } else { 0 }],
+        )?;
+        if enabled {
+            self.backfill_token_counts()
+        } else {
+            Ok(self
+                .conn
+                .execute("UPDATE preferences SET token_count = 0", [])?)
+        }
+    }
+
+    pub fn backfill_token_counts(&self) -> Result<usize> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, item, reason, keywords FROM preferences")?;
+        let rows: Vec<(i64, String, String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+
+        let mut updated = 0usize;
+        for (id, item, reason, keywords_raw) in rows {
+            let keywords = parse_keywords(&keywords_raw);
+            let token_count = estimate_token_count(&item, &reason, &keywords);
+            updated += self.conn.execute(
+                "UPDATE preferences SET token_count = ?1 WHERE id = ?2",
+                params![token_count, id],
+            )?;
+        }
+        Ok(updated)
+    }
+
     // ── Row hydration ────────────────────────────────────────────────────────
 
     // SELECT column order: id(0) item(1) reason(2) keywords(3) base_score(4)
-    //                      source(5) added_at(6) last_seen(7) touch_count(8)
+    //                      source(5) added_at(6) last_seen(7) touch_count(8) token_count(9)
     fn hydrate(row: &rusqlite::Row, cfg: &DecayConfig) -> rusqlite::Result<Preference> {
         let last_seen: String = row.get(7)?;
         let keywords_raw: String = row.get(3)?;
@@ -317,6 +441,7 @@ impl Db {
             added_at: row.get(6)?,
             last_seen,
             touch_count: row.get(8)?,
+            token_count: row.get(9)?,
             score_exponent: s.score_exponent,
             decay_coefficient: s.decay_coefficient,
             effective_weight: s.effective_weight,
@@ -375,17 +500,24 @@ impl Db {
     ) -> Result<()> {
         let now = Utc::now().to_rfc3339();
         let kw = keywords.join(", ");
+        let cfg = self.get_decay_config()?;
+        let token_count = if cfg.token_counting_enabled {
+            estimate_token_count(item, reason, keywords)
+        } else {
+            0
+        };
         self.conn.execute(
             "INSERT INTO preferences
-                (item, reason, keywords, base_score, source, added_at, last_seen)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                (item, reason, keywords, base_score, source, added_at, last_seen, token_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7)
              ON CONFLICT(LOWER(item)) DO UPDATE SET
                 reason     = excluded.reason,
                 keywords   = excluded.keywords,
                 base_score = base_score * 0.4 + excluded.base_score * 0.6,
                 source     = excluded.source,
-                last_seen  = excluded.last_seen",
-            params![item, reason, kw, base_score, source, now],
+                last_seen  = excluded.last_seen,
+                token_count = excluded.token_count",
+            params![item, reason, kw, base_score, source, now, token_count],
         )?;
 
         // Get the row id (new or existing) to write scenario associations
@@ -582,16 +714,16 @@ impl Db {
         keywords: Option<&[String]>,
         scenarios: Option<&[String]>,
     ) -> Result<bool> {
-        let pref_id: Option<i64> = self
+        let current: Option<(i64, String, String, String)> = self
             .conn
             .query_row(
-                "SELECT id FROM preferences WHERE LOWER(item) = LOWER(?1)",
+                "SELECT id, item, reason, keywords FROM preferences WHERE LOWER(item) = LOWER(?1)",
                 params![item],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .ok();
 
-        let Some(pref_id) = pref_id else {
+        let Some((pref_id, current_item, current_reason, current_keywords)) = current else {
             return Ok(false);
         };
 
@@ -631,6 +763,24 @@ impl Db {
             )?;
         }
 
+        if new_item.is_some() || reason.is_some() || keywords.is_some() {
+            let next_item = new_item.unwrap_or(&current_item);
+            let next_reason = reason.unwrap_or(&current_reason);
+            let next_keywords = keywords
+                .map(|kws| kws.to_vec())
+                .unwrap_or_else(|| parse_keywords(&current_keywords));
+            let cfg = self.get_decay_config()?;
+            let token_count = if cfg.token_counting_enabled {
+                estimate_token_count(next_item, next_reason, &next_keywords)
+            } else {
+                0
+            };
+            self.conn.execute(
+                "UPDATE preferences SET token_count = ?1 WHERE id = ?2",
+                params![token_count, pref_id],
+            )?;
+        }
+
         if let Some(scens) = scenarios {
             self.conn.execute(
                 "DELETE FROM preference_scenarios WHERE preference_id = ?1",
@@ -648,7 +798,7 @@ impl Db {
     }
 
     const SELECT: &'static str =
-        "SELECT id, item, reason, keywords, base_score, source, added_at, last_seen, touch_count
+        "SELECT id, item, reason, keywords, base_score, source, added_at, last_seen, touch_count, token_count
          FROM preferences";
 
     fn sorted(mut rows: Vec<Preference>) -> Vec<Preference> {
@@ -875,5 +1025,54 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
 
         Ok(())
+    }
+
+    #[test]
+    fn token_counting_is_config_gated_and_backfilled() -> Result<()> {
+        let path = temp_db_path("token-counting");
+        let db = Db::open(&path)?;
+
+        db.upsert(
+            "简洁中文说明",
+            "Prefer concise Chinese explanations with concrete dates",
+            &["coding".into(), "brevity".into()],
+            &[],
+            9.0,
+            "manual",
+        )?;
+        assert_eq!(db.all()?[0].token_count, 0);
+
+        let backfilled = db.set_token_counting_enabled(true)?;
+        assert_eq!(backfilled, 1);
+        let counted = db.all()?[0].token_count;
+        assert!(counted > 0);
+
+        db.update(
+            "简洁中文说明",
+            None,
+            Some("Prefer very concise Chinese explanations"),
+            None,
+            None,
+            None,
+        )?;
+        assert!(db.all()?[0].token_count > 0);
+
+        let cleared = db.set_token_counting_enabled(false)?;
+        assert_eq!(cleared, 1);
+        assert_eq!(db.all()?[0].token_count, 0);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn estimate_token_count_handles_ascii_and_cjk() {
+        let keywords = vec!["coding".into(), "中文".into()];
+        let count = estimate_token_count("short memory", "偏好简洁输出", &keywords);
+        assert!(count >= 8, "expected mixed-language estimate, got {count}");
     }
 }

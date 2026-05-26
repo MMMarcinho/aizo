@@ -8,6 +8,8 @@ pub struct DecayConfig {
     pub half_life_days: f64,
     /// Minimum decay floor — effective weight never reaches zero from time alone.
     pub floor: f64,
+    /// Experimental observability flag: store estimated memory length tokens.
+    pub token_counting_enabled: bool,
 }
 
 impl Default for DecayConfig {
@@ -15,6 +17,7 @@ impl Default for DecayConfig {
         Self {
             half_life_days: 30.0,
             floor: 0.1,
+            token_counting_enabled: false,
         }
     }
 }
@@ -80,6 +83,7 @@ mod tests {
         DecayConfig {
             half_life_days: 30.0,
             floor: 0.1,
+            token_counting_enabled: false,
         }
     }
 
