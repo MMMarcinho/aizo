@@ -218,6 +218,10 @@ aizo apply <id>...
 Use `aizo recall --touch` only for older integrations that still need recall-time
 refresh. Prefer explicit `apply` for new agent workflows.
 
+If `token_counting_enabled` is on, recalled JSON may include `token_count`. Treat it
+as length observability only; do not use it as a preference weight unless a future
+workflow explicitly defines that policy.
+
 ### Step 6 — Keep it fresh
 
 Preferences evolve. Re-run scenario recall when the task domain changes (e.g., switching

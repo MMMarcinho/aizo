@@ -186,6 +186,8 @@ enum ConfigCmd {
     SetHalfLife { days: f64 },
     /// Set minimum decay floor (0.0–1.0; prevents effective weight from reaching zero)
     SetFloor { floor: f64 },
+    /// Enable or disable estimated token counting for stored memories
+    SetTokenCounting { enabled: String },
 }
 
 fn default_db_path() -> PathBuf {
@@ -227,6 +229,14 @@ fn validate_score(score: f64) -> Result<f64> {
         Ok(score)
     } else {
         anyhow::bail!("--score must be between 0.0 and 10.0, got {score}");
+    }
+}
+
+fn parse_config_bool(value: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "on" | "yes" | "1" | "enabled" => Ok(true),
+        "false" | "off" | "no" | "0" | "disabled" => Ok(false),
+        other => anyhow::bail!("expected true/false for config value, got '{other}'"),
     }
 }
 
@@ -867,30 +877,49 @@ fn main() -> Result<()> {
             println!("Decay");
             println!("  half-life : {} days", cfg.half_life_days);
             println!("  floor     : {}", cfg.floor);
+            println!(
+                "  token cnt : {}",
+                if cfg.token_counting_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
         }
 
-        Command::Config { action } => match action {
-            ConfigCmd::Show => {
-                let cfg = db.get_decay_config()?;
-                println!("{}", serde_json::to_string_pretty(&cfg)?);
-            }
-            ConfigCmd::SetHalfLife { days } => {
-                if days <= 0.0 {
-                    anyhow::bail!("half-life must be > 0");
+        Command::Config { action } => {
+            match action {
+                ConfigCmd::Show => {
+                    let cfg = db.get_decay_config()?;
+                    println!("{}", serde_json::to_string_pretty(&cfg)?);
                 }
-                let cfg = db.get_decay_config()?;
-                db.set_decay_config(days, cfg.floor)?;
-                println!("Decay half-life set to {days} days.");
-            }
-            ConfigCmd::SetFloor { floor } => {
-                if !(0.0..1.0).contains(&floor) {
-                    anyhow::bail!("floor must be in [0.0, 1.0)");
+                ConfigCmd::SetHalfLife { days } => {
+                    if days <= 0.0 {
+                        anyhow::bail!("half-life must be > 0");
+                    }
+                    let cfg = db.get_decay_config()?;
+                    db.set_decay_config(days, cfg.floor)?;
+                    println!("Decay half-life set to {days} days.");
                 }
-                let cfg = db.get_decay_config()?;
-                db.set_decay_config(cfg.half_life_days, floor)?;
-                println!("Decay floor set to {floor}.");
+                ConfigCmd::SetFloor { floor } => {
+                    if !(0.0..1.0).contains(&floor) {
+                        anyhow::bail!("floor must be in [0.0, 1.0)");
+                    }
+                    let cfg = db.get_decay_config()?;
+                    db.set_decay_config(cfg.half_life_days, floor)?;
+                    println!("Decay floor set to {floor}.");
+                }
+                ConfigCmd::SetTokenCounting { enabled } => {
+                    let enabled = parse_config_bool(&enabled)?;
+                    let backfilled = db.set_token_counting_enabled(enabled)?;
+                    if enabled {
+                        println!("Token counting enabled. Backfilled estimated token counts for {backfilled} entries.");
+                    } else {
+                        println!("Token counting disabled. Cleared token counts for {backfilled} entries.");
+                    }
+                }
             }
-        },
+        }
 
         Command::Web { port, no_open } => {
             let rt = tokio::runtime::Runtime::new().context("failed to create async runtime")?;
@@ -899,4 +928,18 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_config_bool_accepts_common_forms() {
+        assert!(parse_config_bool("true").unwrap());
+        assert!(parse_config_bool("ON").unwrap());
+        assert!(!parse_config_bool("false").unwrap());
+        assert!(!parse_config_bool("0").unwrap());
+        assert!(parse_config_bool("maybe").is_err());
+    }
 }
