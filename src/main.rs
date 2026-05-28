@@ -176,6 +176,16 @@ enum Command {
         #[arg(long)]
         no_open: bool,
     },
+
+    /// Update aizo to the latest version (auto-detects cargo or npm install)
+    Upgrade {
+        /// Force a specific install method instead of auto-detecting: cargo or npm
+        #[arg(long)]
+        method: Option<String>,
+        /// Print the command that would run without executing it
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -229,6 +239,75 @@ fn validate_score(score: f64) -> Result<f64> {
         Ok(score)
     } else {
         anyhow::bail!("--score must be between 0.0 and 10.0, got {score}");
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum InstallMethod {
+    Cargo,
+    Npm,
+    Unknown,
+}
+
+/// Guess how the running binary was installed by inspecting its path.
+fn detect_install_method(exe_path: &std::path::Path) -> InstallMethod {
+    let p = exe_path.to_string_lossy();
+    if p.contains("node_modules") {
+        InstallMethod::Npm
+    } else if p.contains(".cargo") {
+        InstallMethod::Cargo
+    } else {
+        InstallMethod::Unknown
+    }
+}
+
+/// Update aizo to the latest published version using the detected package manager.
+fn run_upgrade(method: Option<&str>, dry_run: bool) -> Result<()> {
+    println!("aizo current version: {}", env!("CARGO_PKG_VERSION"));
+
+    let method = match method {
+        Some(m) => match m.trim().to_ascii_lowercase().as_str() {
+            "cargo" => InstallMethod::Cargo,
+            "npm" => InstallMethod::Npm,
+            other => anyhow::bail!("unknown --method '{other}'. Use: cargo or npm"),
+        },
+        None => {
+            let exe =
+                std::env::current_exe().context("cannot determine current executable path")?;
+            detect_install_method(&exe)
+        }
+    };
+
+    let (program, args): (&str, Vec<&str>) = match method {
+        InstallMethod::Cargo => ("cargo", vec!["install", "aizo", "--force"]),
+        InstallMethod::Npm => ("npm", vec!["install", "-g", "aizo-node@latest"]),
+        InstallMethod::Unknown => {
+            println!(
+                "Could not detect how aizo was installed. Update with one of:\n  \
+                 cargo install aizo --force\n  \
+                 npm install -g aizo-node@latest"
+            );
+            return Ok(());
+        }
+    };
+
+    let cmd_str = format!("{program} {}", args.join(" "));
+    if dry_run {
+        println!("Would run: {cmd_str}");
+        return Ok(());
+    }
+
+    println!("Running: {cmd_str}");
+    let status = std::process::Command::new(program)
+        .args(&args)
+        .status()
+        .with_context(|| format!("failed to run '{program}' — is it installed and on PATH?"))?;
+
+    if status.success() {
+        println!("aizo updated to the latest version.");
+        Ok(())
+    } else {
+        anyhow::bail!("update command exited with {status}");
     }
 }
 
@@ -459,6 +538,12 @@ fn load_env() -> (bool, bool) {
 fn main() -> Result<()> {
     let (user_env, project_env) = load_env();
     let cli = Cli::parse();
+
+    // Self-update doesn't need the database — handle it before opening one.
+    if let Command::Upgrade { method, dry_run } = &cli.command {
+        return run_upgrade(method.as_deref(), *dry_run);
+    }
+
     let db_path = cli.db.unwrap_or_else(default_db_path);
     let db = Db::open(&db_path)?;
 
@@ -925,6 +1010,8 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Runtime::new().context("failed to create async runtime")?;
             rt.block_on(web::serve(db, load_scenario_config()?, port, !no_open))?;
         }
+
+        Command::Upgrade { .. } => unreachable!("handled before database initialization"),
     }
 
     Ok(())
@@ -933,6 +1020,23 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_install_method_recognizes_known_paths() {
+        use std::path::Path;
+        assert_eq!(
+            detect_install_method(Path::new("/home/u/.cargo/bin/aizo")),
+            InstallMethod::Cargo
+        );
+        assert_eq!(
+            detect_install_method(Path::new("/usr/lib/node_modules/aizo-node/bin/aizo")),
+            InstallMethod::Npm
+        );
+        assert_eq!(
+            detect_install_method(Path::new("/usr/local/bin/aizo")),
+            InstallMethod::Unknown
+        );
+    }
 
     #[test]
     fn parse_config_bool_accepts_common_forms() {
