@@ -130,6 +130,20 @@ cd aizo && cargo build --release
 cp target/release/aizo /usr/local/bin/aizo
 ```
 
+### Updating
+
+```bash
+# Auto-detects whether aizo was installed via cargo or npm and updates it
+aizo upgrade
+
+# Preview the command without running it
+aizo upgrade --dry-run
+
+# Force a specific package manager
+aizo upgrade --method cargo   # runs: cargo install aizo --force
+aizo upgrade --method npm     # runs: npm install -g aizo-node@latest
+```
+
 ### Configuration
 
 Set env vars in `~/.aizo/.env` (user-wide) or `./.env` (per-project). Shell env always wins.
