@@ -628,11 +628,43 @@ impl Db {
     }
 
     pub fn remove(&self, item: &str) -> Result<bool> {
-        let n = self.conn.execute(
-            "DELETE FROM preferences WHERE LOWER(item) = LOWER(?1)",
-            params![item],
+        let id: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM preferences WHERE LOWER(item) = LOWER(?1)",
+                params![item],
+                |r| r.get(0),
+            )
+            .ok();
+
+        let Some(id) = id else {
+            return Ok(false);
+        };
+
+        self.remove_id(id).map(|removed| removed.is_some())
+    }
+
+    pub fn remove_id(&self, id: i64) -> Result<Option<String>> {
+        let item: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT item FROM preferences WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .ok();
+
+        let Some(item) = item else {
+            return Ok(None);
+        };
+
+        self.conn.execute(
+            "DELETE FROM preference_scenarios WHERE preference_id = ?1",
+            params![id],
         )?;
-        Ok(n > 0)
+        self.conn
+            .execute("DELETE FROM preferences WHERE id = ?1", params![id])?;
+        Ok(Some(item))
     }
 
     /// Return all scenarios with stats.
@@ -1060,6 +1092,48 @@ mod tests {
         let cleared = db.set_token_counting_enabled(false)?;
         assert_eq!(cleared, 1);
         assert_eq!(db.all()?[0].token_count, 0);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn remove_id_deletes_exact_entry_and_scenarios() -> Result<()> {
+        let path = temp_db_path("remove-id");
+        let db = Db::open(&path)?;
+
+        db.upsert(
+            "concise code",
+            "Prefers short implementations",
+            &["coding".into()],
+            &["coding".into()],
+            9.0,
+            "manual",
+        )?;
+        db.upsert("dark mode", "Prefers dark UI", &[], &[], 7.0, "manual")?;
+
+        let concise = db
+            .all()?
+            .into_iter()
+            .find(|p| p.item == "concise code")
+            .expect("concise entry exists");
+        assert_eq!(db.remove_id(concise.id)?, Some("concise code".into()));
+        assert_eq!(db.remove_id(concise.id)?, None);
+
+        let remaining = db.all()?;
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].item, "dark mode");
+
+        let scenario_links: i64 = db.conn.query_row(
+            "SELECT COUNT(*) FROM preference_scenarios WHERE preference_id = ?1",
+            params![concise.id],
+            |r| r.get(0),
+        )?;
+        assert_eq!(scenario_links, 0);
 
         drop(db);
         let _ = std::fs::remove_file(&path);

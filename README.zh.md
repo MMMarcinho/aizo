@@ -175,7 +175,7 @@ aizo [--db <路径>] <命令>
 | `update <标签>` | 更新已有词条的字段（标签、原因、分数、关键词、场景） |
 | `apply <id…>` | 标记召回词条已被实际采用；按 12 小时冷却刷新衰减时钟 |
 | `touch <标签…>` | 按标签重置衰减时钟，同样受 12 小时冷却限制 |
-| `remove <标签…>` | 硬删除一条词条 |
+| `remove <标签…>` / `remove --id <id…>` | 按标签或精确 id 硬删除词条 |
 | `keywords` | 列出所有已存储的关键词及词条数 |
 | `scenarios` | 列出所有场景及词条数、配置关键词 |
 | `clear` | 清空整个偏好画像 |
@@ -232,6 +232,10 @@ aizo add "使用深色模式"   "每次 UI 会话都提到深色主题"    --sco
 # 更新已有词条
 aizo update "简洁的代码" --score 8.5 --keywords 简洁,简短,精炼
 aizo update "冗长注释" --scenarios coding,writing
+
+# 根据 recall/show/top 输出的精确 id 删除
+aizo remove --id 3
+aizo remove --id 3 8 12
 
 # 调整衰减参数（默认：半衰期 30 天，下限 0.1）
 aizo config set-half-life 14

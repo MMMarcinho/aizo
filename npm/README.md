@@ -160,7 +160,7 @@ aizo [--db <path>] <COMMAND>
 | `update <item>` | Update fields on an existing entry (item, reason, score, keywords, scenarios) |
 | `apply <id…>` | Mark recalled entries as actually used; refreshes decay with a 12-hour cooldown |
 | `touch <item…>` | Reset decay clock by item label, subject to the same 12-hour cooldown |
-| `remove <item…>` | Hard-remove an entry |
+| `remove <item…>` / `remove --id <id…>` | Hard-remove entries by label or exact id |
 | `keywords` | List all stored keywords with entry counts |
 | `scenarios` | List all scenarios with entry counts and configured keywords |
 | `clear` | Wipe entire preference profile |
@@ -238,6 +238,10 @@ aizo add "uses dark mode"   "Mentioned dark theme in every UI session" --score 5
 # Update an existing entry
 aizo update "concise code" --score 8.5 --keywords brevity,minimal,short
 aizo update "verbose comments" --scenarios coding,writing
+
+# Remove entries by exact id from recall/show/top output
+aizo remove --id 3
+aizo remove --id 3 8 12
 
 # Tune decay (default: half-life 30d, floor 0.1)
 aizo config set-half-life 14

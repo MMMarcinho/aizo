@@ -135,10 +135,13 @@ enum Command {
         ids: Vec<i64>,
     },
 
-    /// Remove a preference by item label
+    /// Remove preferences by exact id or item label
     Remove {
+        /// Preference IDs to remove exactly (from recall/show/top output)
+        #[arg(long = "id", num_args = 1.., value_delimiter = ',')]
+        ids: Vec<i64>,
         /// Item label to remove (case-insensitive, words joined)
-        #[arg(trailing_var_arg = true, num_args = 1..)]
+        #[arg(trailing_var_arg = true, num_args = 0..)]
         item: Vec<String>,
     },
 
@@ -810,16 +813,38 @@ fn main() -> Result<()> {
             }
         }
 
-        Command::Remove { item } => {
+        Command::Remove { ids, item } => {
             let item_str = item.join(" ");
-            if item_str.is_empty() {
-                anyhow::bail!("usage: aizo remove <item…>");
+            if ids.is_empty() && item_str.is_empty() {
+                anyhow::bail!("usage: aizo remove <item…> OR aizo remove --id <id…>");
             }
-            let removed = db.remove(&item_str)?;
-            if removed {
-                println!("Removed \"{item_str}\"");
+            if !ids.is_empty() && !item_str.is_empty() {
+                anyhow::bail!("use either --id or an item label, not both");
+            }
+
+            if !ids.is_empty() {
+                let mut removed = 0usize;
+                let mut missing = 0usize;
+                for id in ids {
+                    match db.remove_id(id)? {
+                        Some(item) => {
+                            removed += 1;
+                            println!("Removed #{:<4} \"{}\"", id, item);
+                        }
+                        None => {
+                            missing += 1;
+                            println!("Not found: #{id}");
+                        }
+                    }
+                }
+                println!("Removed {removed} ids  ({missing} not found)");
             } else {
-                println!("Not found: \"{item_str}\"");
+                let removed = db.remove(&item_str)?;
+                if removed {
+                    println!("Removed \"{item_str}\"");
+                } else {
+                    println!("Not found: \"{item_str}\"");
+                }
             }
         }
 
