@@ -52,9 +52,6 @@ enum Command {
         /// Refresh last_seen for matched entries, subject to the 12-hour touch cooldown
         #[arg(long)]
         touch: bool,
-        /// Deprecated no-op: recall is read-only by default
-        #[arg(long)]
-        no_touch: bool,
         /// Output raw JSON instead of human-readable text
         #[arg(long)]
         json: bool,
@@ -572,14 +569,8 @@ fn main() -> Result<()> {
             scenario,
             min_score,
             touch,
-            no_touch,
             json,
         } => {
-            if no_touch {
-                eprintln!(
-                    "Note: --no-touch is deprecated; recall is read-only unless --touch is set."
-                );
-            }
             // Merge --score-band and deprecated --type
             let mut bands = score_bands;
             if bands.is_empty() {

@@ -176,7 +176,6 @@ aizo [--db <path>] <COMMAND>
 | `--scenario <name>` | Scenario-tagged recall + keyword expansion from `~/.aizo/scenarios.yaml` |
 | `--min-score <N>` | Minimum `base_score` threshold (0.0–10.0); clamps band lower bounds |
 | `--touch` | Refresh matched entries, subject to the 12-hour cooldown; recall is read-only by default |
-| `--no-touch` | Deprecated no-op kept for older scripts |
 | `--json` | Output raw JSON instead of human-readable text |
 
 **`top` flags:** `--type/-t`, `--scenario`, `--json`. Read-only — never touches `last_seen`.

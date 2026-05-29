@@ -192,7 +192,6 @@ aizo [--db <路径>] <命令>
 | `--scenario <名称>` | 场景召回 + 关键词扩展（从 `~/.aizo/scenarios.yaml` 读取） |
 | `--min-score <N>` | 最低 `base_score` 阈值（0.0–10.0）；会抬高 score-band 的下界 |
 | `--touch` | 刷新匹配词条，受 12 小时冷却限制；`recall` 默认只读 |
-| `--no-touch` | 已废弃的兼容参数；默认就是不 touch |
 | `--json` | 输出原始 JSON（供程序调用） |
 
 **`top` 标志：** `--score-band/-t`、`--scenario`、`--json`。只读——不会刷新 `last_seen`。
