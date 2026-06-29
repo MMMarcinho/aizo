@@ -4,6 +4,7 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use crate::scoring::{self, DecayConfig};
 
@@ -35,7 +36,7 @@ pub struct Preference {
     pub added_at: String,
     pub last_seen: String,   // reset on every reinforcement; drives decay clock
     pub touch_count: i64,    // number of times this entry has been touched
-    pub token_count: i64,    // estimated token length, only maintained when enabled
+    pub token_count: i64,    // BPE token length (o200k_base), only maintained when enabled
     pub score_exponent: f64, // α = (10 − s) / 10
     pub decay_coefficient: f64, // d(t) ∈ [floor, 1.0]
     pub effective_weight: f64, // w = s · d(t)^α
@@ -53,7 +54,37 @@ fn parse_keywords(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Lazily-built BPE tokenizer (`o200k_base`, the encoding used by GPT-4o / o-series
+/// models). The vocabulary is embedded in the binary, so this works fully offline.
+/// `None` is cached if construction ever fails, so we fall back exactly once.
+fn tokenizer() -> Option<&'static tiktoken_rs::CoreBPE> {
+    static BPE: OnceLock<Option<tiktoken_rs::CoreBPE>> = OnceLock::new();
+    BPE.get_or_init(|| tiktoken_rs::o200k_base().ok()).as_ref()
+}
+
+/// Measure the token length of a memory entry.
+///
+/// Uses a real BPE tokenizer (`o200k_base`) for an objective, model-grounded
+/// count — the same tokenization an LLM applies when the memory is loaded into
+/// context. Falls back to the character-heuristic below only if the tokenizer
+/// cannot be initialized.
 pub(crate) fn estimate_token_count(item: &str, reason: &str, keywords: &[String]) -> i64 {
+    // Join only the non-empty segments so empty fields don't add phantom
+    // whitespace tokens to the count.
+    let text = [item, reason, &keywords.join(" ")]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    match tokenizer() {
+        Some(bpe) => bpe.encode_ordinary(&text).len() as i64,
+        None => heuristic_token_count(&text),
+    }
+}
+
+/// Character-based fallback estimate: ~4 ASCII alphanumerics per token, one token
+/// per CJK / non-ASCII glyph. Only used when the BPE tokenizer is unavailable.
+fn heuristic_token_count(text: &str) -> i64 {
     let mut tokens = 0i64;
     let mut ascii_run = 0usize;
 
@@ -64,13 +95,7 @@ pub(crate) fn estimate_token_count(item: &str, reason: &str, keywords: &[String]
         }
     };
 
-    for ch in item
-        .chars()
-        .chain(std::iter::once(' '))
-        .chain(reason.chars())
-        .chain(std::iter::once(' '))
-        .chain(keywords.join(" ").chars())
-    {
+    for ch in text.chars() {
         if ch.is_ascii_alphanumeric() {
             ascii_run += 1;
         } else {
@@ -1144,9 +1169,22 @@ mod tests {
     }
 
     #[test]
-    fn estimate_token_count_handles_ascii_and_cjk() {
+    fn estimate_token_count_uses_real_tokenizer() {
+        // "hello world" is exactly two tokens under o200k_base — an objective,
+        // model-grounded count the character heuristic could not produce.
+        assert_eq!(estimate_token_count("hello", "world", &[]), 2);
+
         let keywords = vec!["coding".into(), "中文".into()];
         let count = estimate_token_count("short memory", "偏好简洁输出", &keywords);
+        assert!(
+            count > 0,
+            "expected mixed-language token count, got {count}"
+        );
+    }
+
+    #[test]
+    fn heuristic_fallback_handles_ascii_and_cjk() {
+        let count = heuristic_token_count("short memory 偏好简洁输出 coding 中文");
         assert!(count >= 8, "expected mixed-language estimate, got {count}");
     }
 }

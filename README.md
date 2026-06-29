@@ -268,9 +268,13 @@ aizo config set-token-counting true
 aizo info
 ```
 
-`set-token-counting true` stores an estimated `token_count` for each memory and
-backfills existing rows. The estimate is observational only: it is returned in JSON
-and shown in the web inspector, but it is not part of the weight formula.
+`set-token-counting true` stores a `token_count` for each memory and backfills
+existing rows. The count comes from a real BPE tokenizer (`o200k_base`, the encoding
+used by GPT-4o / o-series models), so it reflects the actual context length a memory
+consumes rather than a hand-tuned character heuristic. The tokenizer vocabulary is
+embedded in the binary — no network, no model download. The count is observational
+only: it is returned in JSON and shown in the web inspector, but it is not part of the
+weight formula.
 
 ---
 
@@ -309,7 +313,7 @@ CREATE TABLE preferences (
     added_at    TEXT    NOT NULL,
     last_seen   TEXT    NOT NULL,               -- resets decay clock on each reinforcement
     touch_count INTEGER NOT NULL DEFAULT 0,
-    token_count INTEGER NOT NULL DEFAULT 0       -- estimated length, observational only
+    token_count INTEGER NOT NULL DEFAULT 0       -- BPE token length, observational only
 );
 -- UNIQUE on LOWER(item)
 
