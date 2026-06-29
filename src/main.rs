@@ -196,7 +196,7 @@ enum ConfigCmd {
     SetHalfLife { days: f64 },
     /// Set minimum decay floor (0.0–1.0; prevents effective weight from reaching zero)
     SetFloor { floor: f64 },
-    /// Enable or disable estimated token counting for stored memories
+    /// Enable or disable BPE token-length counting (o200k_base) for stored memories
     SetTokenCounting { enabled: String },
 }
 
@@ -1014,7 +1014,7 @@ fn main() -> Result<()> {
                     let enabled = parse_config_bool(&enabled)?;
                     let backfilled = db.set_token_counting_enabled(enabled)?;
                     if enabled {
-                        println!("Token counting enabled. Backfilled estimated token counts for {backfilled} entries.");
+                        println!("Token counting enabled (o200k_base BPE). Backfilled token counts for {backfilled} entries.");
                     } else {
                         println!("Token counting disabled. Cleared token counts for {backfilled} entries.");
                     }

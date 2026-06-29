@@ -8,7 +8,7 @@ pub struct DecayConfig {
     pub half_life_days: f64,
     /// Minimum decay floor — effective weight never reaches zero from time alone.
     pub floor: f64,
-    /// Experimental observability flag: store estimated memory length tokens.
+    /// Observability flag: store BPE-tokenized memory length (o200k_base) per entry.
     pub token_counting_enabled: bool,
 }
 

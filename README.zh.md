@@ -248,8 +248,11 @@ aizo config set-token-counting true
 aizo info
 ```
 
-`set-token-counting true` 会为每条记忆写入估算的 `token_count`，并回填已有数据。
-这个字段目前只用于观测：会出现在 JSON 和 Web 详情面板中，但不会进入权重公式。
+`set-token-counting true` 会为每条记忆写入 `token_count`，并回填已有数据。
+该计数来自真正的 BPE 分词器（`o200k_base`，即 GPT-4o / o 系列模型使用的编码），
+因此反映的是记忆实际占用的上下文长度，而非手写的字符启发式估算。分词器词表已内嵌进
+二进制，无需联网、无需下载模型。这个字段目前只用于观测：会出现在 JSON 和 Web 详情面板中，
+但不会进入权重公式。
 
 ---
 
@@ -289,7 +292,7 @@ CREATE TABLE preferences (
     added_at    TEXT    NOT NULL,
     last_seen   TEXT    NOT NULL,               -- 每次强化时重置衰减时钟
     touch_count INTEGER NOT NULL DEFAULT 0,
-    token_count INTEGER NOT NULL DEFAULT 0       -- 估算长度，仅用于观测
+    token_count INTEGER NOT NULL DEFAULT 0       -- BPE 分词长度，仅用于观测
 );
 -- UNIQUE 约束：LOWER(item)
 
